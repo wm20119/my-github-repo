@@ -87,7 +87,11 @@ def run():
     for pos in pf['positions']:
         # 计算持仓天数（即使K线获取失败也要递增，避免永久滞留）
         if pos.get('last_update') != today:
-            pos['hold_days'] = pos.get('hold_days', 0) + 1
+            # 只在交易日递增（跳过周末）
+            import datetime as _dt
+            today_dt = _dt.datetime.strptime(today, '%Y-%m-%d')
+            if today_dt.weekday() < 5:  # 0-4=周一至周五
+                pos['hold_days'] = pos.get('hold_days', 0) + 1
             pos['last_update'] = today
         
         # K线获取失败计数

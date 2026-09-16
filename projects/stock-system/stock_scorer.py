@@ -172,11 +172,11 @@ def batch_quote_tushare(codes, trade_date=None):
         from datetime import datetime, timedelta
         today = datetime.now()
         # 尝试最近3个交易日(周末/节假日自动回退)
+        ts_codes = [_tushare_code(c) for c in codes]
         for delta in range(0, 5):
             d = today - timedelta(days=delta)
             trade_date = d.strftime('%Y%m%d')
             try:
-                ts_codes = [_tushare_code(c) for c in codes]
                 df = _TUSHARE_PRO.daily_basic(ts_code=','.join(ts_codes),
                                               trade_date=trade_date,
                                               fields='ts_code,turnover_rate,pe_ttm,pb,total_mv')
@@ -1455,10 +1455,10 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         cycle_info = detect_cycle_stage(quote)
         industry_name = cycle_info[0]
         stage_label = cycle_info[1]
-        # 财务数据: Tushare优先, 东方财富F10备选
-        financial = get_financial_data_tushare(code)
+        # 财务数据: 东方财富F10优先(数据更完整), Tushare增速/预告增强
+        financial = get_financial_data(code)  # 东方财富F10主数据源
         if financial is None:
-            financial = get_financial_data(code)  # 东方财富F10备选
+            financial = get_financial_data_tushare(code)  # Tushare备选
         if financial:
             quote['_financial'] = financial  # 保存完整财务数据(含3年历史)
             # 将latest中的字段合并到quote(保持向后兼容)

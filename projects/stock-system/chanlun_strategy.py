@@ -126,8 +126,8 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
     # 条件2: score > 0
     if r['score'] <= 0:
         return False, None
-    # 条件3: MACD diff > 0
-    if r['diff'] <= 0:
+    # 条件3: MACD diff > 0（统一用macd_all，与条件8一致）
+    if macd_all[i] <= 0:
         return False, None
     # 条件4: 价格 >= MA20
     if p < ma20[i]:
@@ -244,8 +244,11 @@ def evaluate_chanlun_quality(klines, name, code):
             should_exit, reason = check_exit_signal(
                 klines, pos['entry_price'], pos['hold_days'], name, code, bar_index=i, _pc=pc)
             if should_exit:
-                p = klines[i]['close']
-                pnl = (p - pos['entry_price']) / pos['entry_price']
+                if reason == '止损':
+                    pnl = STOP_LOSS  # 止损价: entry_price*(1+STOP_LOSS)
+                else:
+                    p = klines[i]['close']
+                    pnl = (p - pos['entry_price']) / pos['entry_price']
                 trades.append({'pnl': pnl * 100, 'reason': reason, 'hold': pos['hold_days']})
                 if reason == '止损':
                     cd_idx = min(i + COOLDOWN_DAYS, len(dates) - 1)  # 数据末尾冷却到末尾
@@ -301,6 +304,7 @@ def scan_recent_signals(klines, name, code, lookback=30):
 
     # 预计算一次
     pc = precompute(klines)
+    dates = pc['dates']
     closes = pc['closes']
     rsi_all = calc_rsi(closes)
     ma20 = pc['ma20']
@@ -376,8 +380,11 @@ def backtest_single(klines, name, code, score_info=None):
             should_exit, reason = check_exit_signal(
                 klines, pos['entry_price'], pos['hold_days'], name, code, bar_index=i, _pc=pc)
             if should_exit:
-                p = klines[i]['close']
-                pnl = (p - pos['entry_price']) / pos['entry_price']
+                if reason == '止损':
+                    pnl = STOP_LOSS  # 止损价: entry_price*(1+STOP_LOSS)
+                else:
+                    p = klines[i]['close']
+                    pnl = (p - pos['entry_price']) / pos['entry_price']
                 trades.append({
                     'pnl': round(pnl * 100, 2), 'reason': reason,
                     'code': code, 'name': name,

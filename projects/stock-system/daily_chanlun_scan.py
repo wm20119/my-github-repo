@@ -12,7 +12,14 @@ from chanlun_strategy import (
 from stock_screening import POOL_CODES
 
 # 股票池名称映射（从stock_config.json读取）
-POOL = [(c, c) for c in POOL_CODES]  # 名称由scan_one中fetch_kline返回
+import json as _json
+_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
+try:
+    with open(_cfg_path) as _f:
+        _cfg = _json.load(_f)
+    POOL = [(c['code'], c['name']) for c in _cfg.get('stock_pool', [])]
+except Exception:
+    POOL = [(c, c) for c in POOL_CODES]
 
 def load_screening_results():
     """加载最近一次选股扫描的结果（检查日期是否为今天）"""

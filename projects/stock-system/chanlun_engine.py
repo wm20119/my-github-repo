@@ -278,10 +278,14 @@ def find_trend_structure(pivots, segments, diff, dea, macd_hist, closes, daily_d
             a_area = sum(abs(m) for m in macd_hist[a_start_idx:a_end_idx + 1] if m < 0)
             c_area = sum(abs(m) for m in macd_hist[c_start_idx:c_end_idx + 1] if m < 0)
 
-        b_diff = diff[b_start_idx:b_end_idx + 1] if b_start_idx < b_end_idx else diff[:10]
-        if b_diff:
-            max_abs_diff = max(abs(d) for d in diff) if diff else 1
-            b_near_zero = any(abs(d) < max_abs_diff * 0.2 for d in b_diff)
+        # B段：跳过EMA热身期不可靠的数据（b_start_idx>=b_end_idx时直接判否）
+        if b_start_idx < b_end_idx:
+            b_diff = diff[b_start_idx:b_end_idx + 1]
+            if b_diff:
+                max_abs_diff = max(abs(d) for d in diff) if diff else 1
+                b_near_zero = any(abs(d) < max_abs_diff * 0.2 for d in b_diff)
+            else:
+                b_near_zero = False
         else:
             b_near_zero = False
 

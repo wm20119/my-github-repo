@@ -35,10 +35,17 @@ def main():
     else:
         sample = valid[:300] if valid else []
 
-    # 股票池也加上
-    pool = [('600030', '中信证券'), ('688019', '安集科技'), ('688008', '澜起科技'),
-            ('600584', '长电科技'), ('300750', '宁德时代'), ('000977', '浪潮信息'),
-            ('002156', '通富微电')]
+    # 股票池从stock_config.json读取
+    import json as _json
+    _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
+    try:
+        with open(_cfg_path) as _f:
+            _cfg = _json.load(_f)
+        pool = [(c['code'], c['name']) for c in _cfg.get('stock_pool', [])]
+    except Exception:
+        pool = [('600030', '中信证券'), ('688019', '安集科技'), ('688008', '澜起科技'),
+                ('600584', '长电科技'), ('300750', '宁德时代'), ('000977', '浪潮信息'),
+                ('002156', '通富微电')]
     all_codes = pool + [(c, n) for c, n in sample if c not in [p[0] for p in pool]]
     print(f"共{len(all_codes)}只")
 
@@ -83,7 +90,7 @@ def main():
     print(f"\n  缠论A/B级票:")
     for code, cs in sorted(passed_ch.items(), key=lambda x: -x[1]['win_rate']):
         name = klines_data[code][1]
-        pf_str = '∞' if cs['profit_factor'] == float('inf') else f"{cs['profit_factor']:>5.2f}"
+        pf_str = '∞' if cs['profit_factor'] >= 999 else f"{cs['profit_factor']:>5.2f}"
         print(f"    {name:<8} {code} {cs['total_trades']}笔 胜率{cs['win_rate']:>5.1f}% "
               f"均收{cs['avg_return']:>+6.1f}% 盈亏比{pf_str}")
 
