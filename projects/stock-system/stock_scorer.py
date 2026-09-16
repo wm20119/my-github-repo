@@ -289,6 +289,163 @@ def get_financial_data_tushare(code, years=3):
 
 
 # ============================================================
+# Tushare 资金流向评分
+# ============================================================
+
+_SW_INDUSTRY_CACHE = {}  # code -> industry_name
+
+
+def score_moneyflow(code):
+    """资金流向评分 (0-5): 主力净流入方向与持续性
+    主力净流入 = 超大单买入额 + 大单买入额 - 超大单卖出额 - 大单卖出额
+    评分: 连续3天净流入→5, 整体净流入→4, 持平→3, 净流出→2, 大幅净流出→1
+    """
+    if _TUSHARE_PRO is None:
+        return None
+    try:
+        from datetime import timedelta
+        ts_code = _tushare_code(code)
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.now() - timedelta(days=15)).strftime('%Y%m%d')
+        df = _TUSHARE_PRO.moneyflow(ts_code=ts_code,
+                                     start_date=start_date,
+                                     end_date=end_date)
+        if df is None or len(df) == 0:
+            return None
+        df = df.sort_values('trade_date', ascending=False).head(5)
+        # 主力净流入 = 超大单+大单 买入-卖出 (单位: 元)
+        df['main_net'] = (
+            df['buy_elg_amount'].fillna(0) + df['buy_lg_amount'].fillna(0)
+            - df['sell_elg_amount'].fillna(0) - df['sell_lg_amount'].fillna(0)
+        )
+        net_flows = df['main_net'].tolist()
+        if not net_flows:
+            return None
+        # 连续净流入天数(从最近一天往前数)
+        consecutive_positive = 0
+        for n in net_flows:
+            if n > 0:
+                consecutive_positive += 1
+            else:
+                break
+        total_net = sum(net_flows)
+        avg_net = total_net / len(net_flows)
+
+        if consecutive_positive >= 3:
+            return 5   # 连续3天+主力净流入
+        if total_net > 0:
+            return 4   # 整体主力净流入
+        if abs(avg_net) < 5e6:  # 接近持平 (<500万元)
+            return 3
+        if total_net < -5e7:    # 大幅净流出 (>5000万)
+            return 1
+        return 2               # 净流出
+    except Exception:
+        return None
+
+
+# ============================================================
+# Tushare 业绩预告+业绩快报
+# ============================================================
+
+def get_forecast_data(code):
+    """获取最新业绩预告: type(预增/预减/略增/略减/预平/扭亏/续亏/首亏), p_change_min/max"""
+    if _TUSHARE_PRO is None:
+        return None
+    try:
+        ts_code = _tushare_code(code)
+        df = _TUSHARE_PRO.forecast(
+            ts_code=ts_code,
+            fields='ts_code,ann_date,end_date,type,p_change_min,p_change_max,'
+                   'net_profit_min,net_profit_max,summary')
+        if df is None or len(df) == 0:
+            return None
+        df = df.sort_values('ann_date', ascending=False)
+        row = df.iloc[0]
+        return {
+            'type': str(row.get('type', '')),
+            'p_change_min': row.get('p_change_min'),
+            'p_change_max': row.get('p_change_max'),
+            'net_profit_min': row.get('net_profit_min'),
+            'net_profit_max': row.get('net_profit_max'),
+            'summary': str(row.get('summary', '')),
+        }
+    except Exception:
+        return None
+
+
+def get_express_data(code):
+    """获取最新业绩快报: revenue, n_income_attr_p(归母净利润)等"""
+    if _TUSHARE_PRO is None:
+        return None
+    try:
+        ts_code = _tushare_code(code)
+        df = _TUSHARE_PRO.express(
+            ts_code=ts_code,
+            fields='ts_code,ann_date,end_date,revenue,operate_profit,'
+                   'total_profit,n_income,n_income_attr_p')
+        if df is None or len(df) == 0:
+            return None
+        df = df.sort_values('ann_date', ascending=False)
+        row = df.iloc[0]
+        return {
+            'revenue': row.get('revenue'),
+            'n_income_attr_p': row.get('n_income_attr_p'),
+            'ann_date': str(row.get('ann_date', '')),
+        }
+    except Exception:
+        return None
+
+
+# ============================================================
+# Tushare 申万行业分类
+# ============================================================
+
+def get_sw_industry(code):
+    """获取申万二级行业名称 (通过Tushare index_classify + stock_basic)
+    优先用index_classify获取分类定义, 再用stock_basic匹配
+    """
+    global _SW_INDUSTRY_CACHE
+    if _TUSHARE_PRO is None:
+        return None
+    if code in _SW_INDUSTRY_CACHE:
+        return _SW_INDUSTRY_CACHE[code]
+    try:
+        ts_code = _tushare_code(code)
+        # 方法1: stock_basic直接获取行业字段
+        df = _TUSHARE_PRO.stock_basic(ts_code=ts_code,
+                                       fields='ts_code,industry,list_status')
+        if df is not None and len(df) > 0:
+            industry = df.iloc[0].get('industry')
+            if industry and str(industry).strip():
+                _SW_INDUSTRY_CACHE[code] = str(industry).strip()
+                return str(industry).strip()
+        # 方法2: 通过index_classify获取申万二级行业分类列表, 再匹配
+        try:
+            classify_df = _TUSHARE_PRO.index_classify(level='L2', src='SW2021')
+            if classify_df is not None and len(classify_df) > 0:
+                for _, row in classify_df.iterrows():
+                    idx_code = row.get('index_code', '')
+                    ind_name = row.get('industry_name', '')
+                    if not idx_code:
+                        continue
+                    try:
+                        members = _TUSHARE_PRO.index_member(index_code=idx_code)
+                        if members is not None and len(members) > 0:
+                            member_codes = members['con_code'].tolist()
+                            if ts_code in member_codes:
+                                _SW_INDUSTRY_CACHE[code] = ind_name
+                                return ind_name
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================
 # K线数据: 新浪
 # ============================================================
 
@@ -368,7 +525,47 @@ def calc_volume_trend(volumes, n=5):
 # ============================================================
 
 def get_industry_pb_stats(code):
-    """获取行业PB统计: (industry_name, avg_pb, stock_pb, rank_ratio)"""
+    """获取行业PB统计: (industry_name, avg_pb, stock_pb, rank_ratio)
+    优先用Tushare申万行业分类动态获取同行业股票, fallback到硬编码映射
+    """
+    # ---- 优先: Tushare申万行业动态获取 ----
+    sw_industry = get_sw_industry(code)
+    if sw_industry and _TUSHARE_PRO is not None:
+        try:
+            # 获取同行业上市股票
+            df = _TUSHARE_PRO.stock_basic(industry=sw_industry,
+                                           list_status='L',
+                                           fields='ts_code,name')
+            if df is not None and len(df) > 0:
+                # ts_code '600030.SH' → '600030'
+                peer_codes = [tc.split('.')[0] for tc in df['ts_code'].tolist()]
+                # 排除自身, 取前15只做对比
+                peer_codes = [c for c in peer_codes if c != code][:15]
+                if peer_codes:
+                    quotes = batch_quote_tencent(peer_codes[:8])
+                    # 也把自身PB加进去
+                    my_quote = batch_quote_tencent([code])
+                    if code in my_quote and my_quote[code] and my_quote[code].get('pb', 0) > 0:
+                        quotes[code] = my_quote[code]
+                    pbs = []
+                    stock_pb = None
+                    for c, q in quotes.items():
+                        if q and q.get('pb') and q['pb'] > 0:
+                            pbs.append(q['pb'])
+                            if c == code:
+                                stock_pb = q['pb']
+                    if pbs:
+                        avg_pb = sum(pbs) / len(pbs)
+                        if stock_pb is None:
+                            return sw_industry, avg_pb, None, None
+                        rank_ratio = sum(1 for p in pbs if p <= stock_pb) / len(pbs)
+                        return sw_industry, avg_pb, stock_pb, rank_ratio
+                    else:
+                        return sw_industry, None, stock_pb, None
+        except Exception:
+            pass
+
+    # ---- fallback: 硬编码行业映射 ----
     if code not in INDUSTRY_PEERS:
         return None, None, None, None
     industry_name, peers = INDUSTRY_PEERS[code]
@@ -602,7 +799,10 @@ def score_roe(quote):
 
 
 def score_growth(quote):
-    """扣非净利润增速评分 (0-5) - 使用东方财富F10真实数据, 优先季报"""
+    """扣非净利润增速评分 (0-5) - 使用东方财富F10真实数据, 优先季报
+    增强: 结合Tushare业绩预告/快报, 预增>30%加1分, 预减>30%扣1分
+    """
+    code = quote.get('code', '')
     # 优先用3年扣非增速中位数
     financial = quote.get('_financial', None)
     if financial:
@@ -614,30 +814,69 @@ def score_growth(quote):
         g = quote.get('profit_growth_pct', None)
     if g is not None:
         if g >= 60:
-            return 5
-        if g >= 30:
-            return 4
-        if g >= 10:
-            return 3
-        if g > 0:
-            return 2
-        if g > -20:
-            return 1
-        return 0
-    # fallback到USER_DATA
-    code = quote.get('code', '')
-    g = USER_DATA.get(code, {}).get('eps_growth_pct', 0)
-    if g >= 60:
-        return 5
-    if g >= 30:
-        return 4
-    if g >= 10:
-        return 3
-    if g > 0:
-        return 2
-    if g > -20:
-        return 1
-    return 0
+            base_score = 5
+        elif g >= 30:
+            base_score = 4
+        elif g >= 10:
+            base_score = 3
+        elif g > 0:
+            base_score = 2
+        elif g > -20:
+            base_score = 1
+        else:
+            base_score = 0
+    else:
+        # fallback到USER_DATA
+        g = USER_DATA.get(code, {}).get('eps_growth_pct', 0)
+        if g >= 60:
+            base_score = 5
+        elif g >= 30:
+            base_score = 4
+        elif g >= 10:
+            base_score = 3
+        elif g > 0:
+            base_score = 2
+        elif g > -20:
+            base_score = 1
+        else:
+            base_score = 0
+
+    # ---- Tushare业绩预告+快报增强 ----
+    forecast_adj = 0
+    try:
+        forecast = get_forecast_data(code)
+        if forecast:
+            ftype = str(forecast.get('type', ''))
+            p_max = forecast.get('p_change_max')
+            p_min = forecast.get('p_change_min')
+            # 预增且增幅>30% → +1分
+            if ftype == '预增' and p_max is not None:
+                try:
+                    if float(p_max) > 30:
+                        forecast_adj = 1
+                except (ValueError, TypeError):
+                    pass
+            # 预减且降幅>30% → -1分
+            elif ftype == '预减' and p_min is not None:
+                try:
+                    if float(p_min) < -30:
+                        forecast_adj = -1
+                except (ValueError, TypeError):
+                    pass
+            # 首亏 → -1分 (首次亏损风险)
+            elif ftype == '首亏':
+                forecast_adj = -1
+        # 业绩快报: 归母净利润同比增速辅助验证
+        if forecast_adj == 0:
+            express = get_express_data(code)
+            if express and express.get('n_income_attr_p') is not None:
+                # 快报归母净利润为负(亏损)
+                if float(express['n_income_attr_p']) < 0:
+                    forecast_adj = -1
+    except Exception:
+        pass
+
+    return max(0, min(5, base_score + forecast_adj))
 
 
 def score_debt(quote):
@@ -1349,6 +1588,22 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
             pass
         sentiment = min(15, sentiment + market_bonus)
 
+        # ---- v12: 资金流向加分 (0-3) ----
+        moneyflow_bonus = 0
+        try:
+            mf_score = score_moneyflow(code)
+            if mf_score is not None:
+                if mf_score >= 5:
+                    moneyflow_bonus = 3   # 连续净流入, 强烈看多
+                elif mf_score >= 4:
+                    moneyflow_bonus = 2   # 整体净流入
+                elif mf_score >= 3:
+                    moneyflow_bonus = 1   # 持平
+                # mf_score <= 2 不加分 (净流出)
+        except Exception:
+            pass
+        sentiment = min(15, sentiment + moneyflow_bonus)
+
         total = fundamental + valuation + chokepoint + technical + sentiment
         
         # ---- 加减分项 ----
@@ -1378,6 +1633,85 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
             if len(rev) >= 2 and len(prof) >= 2:
                 if rev[-1] > 0 and prof[-1] < 0:
                     total -= 3  # 增收不增利扣分
+        
+        # ---- 风险因子(限售解禁/大宗交易/股权质押) ----
+        unlock_risk = 0
+        block_risk = 0
+        pledge_risk = 0
+        if _TUSHARE_PRO is not None:
+            # 1. 限售解禁: 未来30天解禁比例
+            try:
+                ts_code = _tushare_code(code)
+                today = datetime.now().strftime('%Y%m%d')
+                from datetime import timedelta
+                end_date = (datetime.now() + timedelta(days=30)).strftime('%Y%m%d')
+                df_unlock = _TUSHARE_PRO.share_float(ts_code=ts_code,
+                                                       start_date=today,
+                                                       end_date=end_date,
+                                                       fields='float_ratio')
+                if df_unlock is not None and not df_unlock.empty:
+                    max_float_ratio = df_unlock['float_ratio'].max()
+                    if float(max_float_ratio) > 5:
+                        total -= 3
+                        unlock_risk = -3
+                    elif float(max_float_ratio) > 2:
+                        total -= 1
+                        unlock_risk = -1
+            except Exception:
+                pass
+            # 2. 大宗交易: 近5天折价/溢价
+            try:
+                ts_code = _tushare_code(code)
+                today = datetime.now().strftime('%Y%m%d')
+                start_5d = (datetime.now() - timedelta(days=7)).strftime('%Y%m%d')
+                df_block = _TUSHARE_PRO.block_trade(ts_code=ts_code,
+                                                     start_date=start_5d,
+                                                     end_date=today,
+                                                     fields='ts_code,trade_date,price,vol,amount,buyer,seller')
+                if df_block is not None and not df_block.empty:
+                    # 用每日收盘价计算折溢价: (大宗价格 / 收盘价 - 1) * 100
+                    daily_df = _TUSHARE_PRO.daily(ts_code=ts_code,
+                                                   start_date=start_5d,
+                                                   end_date=today,
+                                                   fields='ts_code,trade_date,close')
+                    if daily_df is not None and not daily_df.empty:
+                        close_map = dict(zip(daily_df['trade_date'], daily_df['close']))
+                        max_discount = 0
+                        max_premium = 0
+                        for _, row in df_block.iterrows():
+                            trade_date = row.get('trade_date', '')
+                            close_price = close_map.get(trade_date)
+                            block_price = row.get('price')
+                            if close_price and block_price and float(close_price) > 0:
+                                premium_pct = (float(block_price) / float(close_price) - 1) * 100
+                                if premium_pct < 0:
+                                    max_discount = min(max_discount, premium_pct)
+                                elif premium_pct > 0:
+                                    max_premium = max(max_premium, premium_pct)
+                        if abs(max_discount) > 5:
+                            total -= 2
+                            block_risk = -2
+                        if max_premium > 5:
+                            total += 1
+                            block_risk = 1
+            except Exception:
+                pass
+            # 3. 股权质押: 最新质押比例
+            try:
+                ts_code = _tushare_code(code)
+                df_pledge = _TUSHARE_PRO.pledge_stat(ts_code=ts_code,
+                                                      fields='ts_code,end_date,pledge_ratio')
+                if df_pledge is not None and not df_pledge.empty:
+                    df_pledge = df_pledge.sort_values('end_date', ascending=False)
+                    latest_ratio = float(df_pledge.iloc[0]['pledge_ratio'])
+                    if latest_ratio > 50:
+                        total -= 3
+                        pledge_risk = -3
+                    elif latest_ratio > 30:
+                        total -= 1
+                        pledge_risk = -1
+            except Exception:
+                pass
         
         total = max(0, min(100, total))
 
@@ -1421,6 +1755,11 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
                 'tech_rsi': tech_rsi,
                 'sent_turnover': sent_turnover, 'sent_momentum': sent_momentum,
                 'sent_volatility': sent_volatility,
+                'fund_flow': moneyflow_bonus,
+                'sw_industry': industry_name,
+                'unlock_risk': unlock_risk,
+                'block_risk': block_risk,
+                'pledge_risk': pledge_risk,
             }
         })
 
