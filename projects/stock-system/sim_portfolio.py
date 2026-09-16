@@ -242,6 +242,8 @@ def run():
                 }
                 pf['positions'].append(new_pos)
                 bought.append(new_pos)
+                # 买入后重新计算NAV，确保后续仓位大小基于递减的净值
+                current_nav = pf['cash'] + sum(p['market_value'] for p in pf['positions'])
                 if 'used_pivots' not in pf:
                     pf['used_pivots'] = []
                 pf['used_pivots'].append(pivot_key)

@@ -306,16 +306,45 @@ def scan_recent_signals(klines, name, code, lookback=30):
     ma20 = pc['ma20']
     vol_ma10 = pc['vol_ma10']
 
+    # v3.6优化：只做一次full_analysis，然后逐bar检查买卖点是否在lookback窗口内
+    start_idx = max(WINDOW, len(klines) - lookback)
+    recent = klines[start_idx - WINDOW:]  # 包含分析所需历史
+    try:
+        r = ce.full_analysis(recent, name, code)
+    except Exception:
+        return []
+    if not r or not r['pivots'] or r['score'] <= 0 or r['diff'] <= 0:
+        return []
+
+    bs = [bp for bp in r['buy_sell_points']
+          if bp['type'] == '第三类买点' and bp['direction'] == 'buy']
+    if not bs:
+        return []
+
+    zg = r['pivots'][-1]['zg']
+    macd_all = pc['macd_all']
     signals = []
-    for i in range(max(WINDOW, len(klines) - lookback), len(klines)):
-        ok, sig = check_entry_signal(klines, name, code, bar_index=i, _pc=pc)
-        if ok and sig:
-            above = (klines[i]['close'] - ma20[i]) / ma20[i] * 100 if ma20[i] > 0 else 0
-            vr = klines[i]['volume'] / vol_ma10[i] if vol_ma10[i] > 0 else 1
-            signals.append({
-                'date': sig['date'], 'price': sig['price'],
-                'rsi': rsi_all[i], 'above_ma20': above, 'vol_ratio': vr,
-            })
+    for i in range(start_idx, len(klines)):
+        if i < 3 or i >= len(macd_all):
+            continue
+        p = klines[i]['close']
+        cl_window = [d['close'] for d in klines[i - WINDOW:i]]
+        if (len(cl_window) >= 10
+                and p < ma20[i]
+                and p <= zg
+                and p < max(cl_window[-10:])
+                and not (macd_all[i] > macd_all[i - 1] > macd_all[i - 2])):
+            continue
+        # 检查是否有第三类买点在此bar或之前出现
+        for bp in bs:
+            if p > zg and p >= max(cl_window[-10:]) and macd_all[i] > macd_all[i - 1] > macd_all[i - 2]:
+                above = (p - ma20[i]) / ma20[i] * 100 if ma20[i] > 0 else 0
+                vr = klines[i]['volume'] / vol_ma10[i] if vol_ma10[i] > 0 else 1
+                signals.append({
+                    'date': dates[i], 'price': p,
+                    'rsi': rsi_all[i], 'above_ma20': above, 'vol_ratio': vr,
+                })
+                break
     return signals
 
 # ============================================================

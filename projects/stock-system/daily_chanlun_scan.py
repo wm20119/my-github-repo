@@ -12,15 +12,6 @@ from chanlun_strategy import (
 from stock_screening import POOL_CODES
 
 # 股票池名称映射（从stock_config.json读取）
-import json as _json
-def _load_pool_names():
-    try:
-        with open(os.path.expanduser('~/.hermes/scripts/stock_config.json')) as f:
-            cfg = _json.load(f)
-        return {c: c for c in cfg.get('stocks', [])}  # 代码→代码，名称由K线数据提供
-    except Exception:
-        return {}
-
 POOL = [(c, c) for c in POOL_CODES]  # 名称由scan_one中fetch_kline返回
 
 def load_screening_results():
@@ -49,7 +40,7 @@ def scan_one(code, name):
     """扫描单只票，返回结果字典"""
     try:
         kl = fetch_kline(code, 1000)
-        if len(kl) < WINDOW + 100:
+        if not kl or len(kl) < WINDOW + 100:
             return None
 
         # 质量评估

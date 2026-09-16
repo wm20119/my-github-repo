@@ -170,7 +170,7 @@ def run_screening(skip_step1=False):
         ma20_now = sum(closes[-20:]) / 20
         above = (latest['close'] - ma20_now) / ma20_now * 100 if ma20_now > 0 else 0
 
-        pf_str = '∞' if c['profit_factor'] == float('inf') else f"{c['profit_factor']:.2f}"
+        pf_str = '∞' if c['profit_factor'] >= 999 else f"{c['profit_factor']:.2f}"
         report.append(f"\n{s['name']}({code}) ¥{latest['close']:.2f} 离MA20{above:+.1f}%")
         report.append(f"  评分: {s['total']:.0f}({s['rating']}) 基{s['fundamental']}+估{s['valuation']}+卡{s['chokepoint']}+技{s['technical']}+情{s['sentiment']}")
         report.append(f"  缠论: {c['quality']}级 胜率{c['win_rate']:.0f}% 盈亏比{pf_str}")

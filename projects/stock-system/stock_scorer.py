@@ -22,6 +22,24 @@ try:
 except ImportError:
     pd = None
 
+try:
+    import tushare as ts
+except ImportError:
+    ts = None
+
+# --- Tushare token ---
+_TUSHARE_TOKEN = None
+_TUSHARE_PRO = None
+_TUSHARE_TOKEN_PATH = os.path.expanduser('~/.tushare/token.txt')
+try:
+    with open(_TUSHARE_TOKEN_PATH, 'r') as _f:
+        _TUSHARE_TOKEN = _f.read().strip()
+    if _TUSHARE_TOKEN and ts:
+        ts.set_token(_TUSHARE_TOKEN)
+        _TUSHARE_PRO = ts.pro_api()
+except Exception:
+    pass
+
 # ============================================================
 # 常量与配置
 # ============================================================
@@ -82,9 +100,9 @@ def get_quote_tencent(code):
         return {
             'code': code, 'name': name, 'price': price,
             'change_pct': change_pct,
-            'turnover_rate': turnover, 'turnover': turnover,
-            'pe_ttm': pe, 'pe': pe, 'pb': pb,
-            'float_cap': float_cap, 'market_cap_yi': market_cap, 'market_cap': market_cap,
+            'turnover_rate': turnover,
+            'pe': pe, 'pb': pb,
+            'market_cap': market_cap,
             'amount_yi': amount_yi,
         }
     except Exception:
@@ -129,6 +147,145 @@ def batch_quote_tencent(codes):
     except Exception:
         pass
     return result
+
+
+# ============================================================
+# Tushare 数据源 (替代腾讯行情+akshare利润表)
+# ============================================================
+
+def _tushare_code(code):
+    """股票代码 → Tushare ts_code (600030 → 600030.SH)"""
+    if code.startswith('8'):
+        return f'{code}.BJ'
+    if code.startswith(('6', '9')):
+        return f'{code}.SH'
+    return f'{code}.SZ'
+
+
+def batch_quote_tushare(codes, trade_date=None):
+    """从Tushare daily_basic获取PE/PB/换手率/总市值
+    返回 dict[code] -> {pe, pb, turnover_rate, market_cap}
+    """
+    if _TUSHARE_PRO is None or not codes:
+        return {}
+    if trade_date is None:
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        # 尝试最近3个交易日(周末/节假日自动回退)
+        for delta in range(0, 5):
+            d = today - timedelta(days=delta)
+            trade_date = d.strftime('%Y%m%d')
+            try:
+                ts_codes = [_tushare_code(c) for c in codes]
+                df = _TUSHARE_PRO.daily_basic(ts_code=','.join(ts_codes),
+                                              trade_date=trade_date,
+                                              fields='ts_code,turnover_rate,pe_ttm,pb,total_mv')
+                if df is not None and len(df) > 0:
+                    break
+            except Exception:
+                df = None
+                continue
+        else:
+            return {}
+    else:
+        try:
+            ts_codes = [_tushare_code(c) for c in codes]
+            df = _TUSHARE_PRO.daily_basic(ts_code=','.join(ts_codes),
+                                          trade_date=trade_date,
+                                          fields='ts_code,turnover_rate,pe_ttm,pb,total_mv')
+        except Exception:
+            return {}
+    if df is None or len(df) == 0:
+        return {}
+    result = {}
+    for _, row in df.iterrows():
+        # ts_code: 600030.SH → 600030
+        stock_code = row['ts_code'].split('.')[0]
+        result[stock_code] = {
+            'pe': float(row.get('pe_ttm', 0) or 0),
+            'pb': float(row.get('pb', 0) or 0),
+            'turnover_rate': float(row.get('turnover_rate', 0) or 0),
+            'market_cap': float(row.get('total_mv', 0) or 0) / 10000,  # 万元→亿
+        }
+    return result
+
+
+def get_financial_data_tushare(code, years=3):
+    """从Tushare income获取利润表, 返回东方财富F10同构格式的dict或None
+    返回: {years: [...], quarter: {...}, weighted: {...}, deducted_growth_pct: ...}
+    """
+    if _TUSHARE_PRO is None:
+        return None
+    try:
+        ts_code = _tushare_code(code)
+        # 获取最近N+1年年报+最新季报
+        df = _TUSHARE_PRO.income(ts_code=ts_code,
+                                 fields='ts_code,ann_date,f_ann_date,end_date,'
+                                        'revenue,n_income_attr_p,revenue_yoy,n_income_attr_p_yoy')
+        if df is None or len(df) == 0:
+            return None
+        # 按end_date排序(降序)
+        df['end_date'] = df['end_date'].astype(str)
+        df = df.sort_values('end_date', ascending=False)
+        # 筛选年报(1231)
+        annual = df[df['end_date'].str.endswith('1231')]
+        # 筛选最新一期(非年报)
+        non_annual = df[~df['end_date'].str.endswith('1231')]
+
+        def _parse(row):
+            return {
+                'net_profit': float(row.get('n_income_attr_p', 0) or 0),
+                'revenue': float(row.get('revenue', 0) or 0),
+                'profit_growth_pct': float(row.get('n_income_attr_p_yoy', 0) or 0),
+                'revenue_growth_pct': float(row.get('revenue_yoy', 0) or 0),
+                'report_date': str(row.get('end_date', '')),
+            }
+
+        annual_reports = [_parse(r) for _, r in annual.head(years + 1).iterrows()]
+        latest_quarter = _parse(non_annual.iloc[0]) if len(non_annual) > 0 else None
+
+        if not annual_reports:
+            if latest_quarter:
+                return {'years': [], 'quarter': latest_quarter,
+                        'weighted': latest_quarter,
+                        'deducted_growth_pct': latest_quarter.get('profit_growth_pct')}
+            return None
+
+        latest_annual = annual_reports[0]
+
+        # 加权平均(简化: Tushare无扣非数据,用净利润代替)
+        weighted = {}
+        for field in ['net_profit']:
+            vals = [y.get(field) for y in annual_reports[:years] if y.get(field)]
+            if vals:
+                weighted[field] = sum(vals) / len(vals)
+            else:
+                weighted[field] = None
+
+        # 增速(优先用季报,否则用年报同比)
+        deducted_growth = None
+        if latest_quarter and latest_quarter.get('profit_growth_pct'):
+            deducted_growth = latest_quarter['profit_growth_pct']
+        elif len(annual_reports) >= 2 and annual_reports[1].get('net_profit'):
+            this = latest_annual.get('net_profit', 0)
+            last = annual_reports[1].get('net_profit', 0)
+            if last != 0:
+                deducted_growth = (this - last) / abs(last) * 100
+
+        return {
+            'years': annual_reports[:years],
+            'quarter': latest_quarter,
+            'weighted': weighted,
+            'deducted_growth_pct': deducted_growth,
+            'latest': {
+                'net_profit': latest_annual.get('net_profit'),
+                'revenue': latest_annual.get('revenue'),
+                'profit_growth_pct': latest_annual.get('profit_growth_pct'),
+                'revenue_growth_pct': latest_annual.get('revenue_growth_pct'),
+            },
+        }
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -375,7 +532,7 @@ def _get_financial_trends(code):
         df = ak.stock_financial_analysis_indicator(symbol=code, start_year='2021')
         if df is None or len(df) < 2:
             return None
-        annual = df[df['日期'].astype(str).str.contains('12-31')]
+        annual = df[df['日期'].astype(str).str.contains('12-31')].sort_index()
         if len(annual) < 3:
             # 只使用年报数据，不混合季报
             return None
@@ -1032,12 +1189,21 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         market_quote = get_quote_tencent('000001')
     except Exception:
         pass
+    # Tushare批量获取行情(PE/PB/换手率/总市值)
+    tushare_quotes = batch_quote_tushare(codes)
     for code in codes:
         print(f'  正在分析 {code}...', file=sys.stderr)
         quote = get_quote_tencent(code)
         if not quote or quote['price'] == 0:
             print(f'  ⚠ {code} 无法获取行情, 跳过', file=sys.stderr)
             continue
+        # Tushare数据覆盖(更准确的PE/PB/换手率/总市值)
+        if code in tushare_quotes:
+            ts_data = tushare_quotes[code]
+            if ts_data.get('pe'): quote['pe'] = ts_data['pe']
+            if ts_data.get('pb'): quote['pb'] = ts_data['pb']
+            if ts_data.get('turnover_rate'): quote['turnover_rate'] = ts_data['turnover_rate']
+            if ts_data.get('market_cap'): quote['market_cap'] = ts_data['market_cap']
         # K线
         kline = get_kline_sina(code, 120)
         closes = [d['close'] for d in kline]
@@ -1050,12 +1216,10 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         cycle_info = detect_cycle_stage(quote)
         industry_name = cycle_info[0]
         stage_label = cycle_info[1]
-        stage_cn = {
-            'bottom': '底部', 'recovery': '复苏',
-            'peak': '顶部', 'decline': '衰退', 'none': '—'
-        }.get(stage_label, '—')
-        # 财务数据
-        financial = get_financial_data(code)
+        # 财务数据: Tushare优先, 东方财富F10备选
+        financial = get_financial_data_tushare(code)
+        if financial is None:
+            financial = get_financial_data(code)  # 东方财富F10备选
         if financial:
             quote['_financial'] = financial  # 保存完整财务数据(含3年历史)
             # 将latest中的字段合并到quote(保持向后兼容)
@@ -1109,7 +1273,7 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         val_pe = score_pe_historical(quote, industry_stats)
         val_pb = score_pb_rationality(quote, industry_stats)
         val_peg = score_peg(quote)
-        valuation = val_pe + val_pb + val_peg
+        valuation = min(10, val_pe + val_pb + val_peg)
 
         # ---- 卡点 (25) ----
         chokepoint = score_chokepoint(code, industry_name, chokepoint_db=local_chokepoint)

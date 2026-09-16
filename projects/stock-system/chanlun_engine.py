@@ -288,7 +288,7 @@ def find_trend_structure(pivots, segments, diff, dea, macd_hist, closes, daily_d
         if a_area > 1:
             ratio = c_area / a_area
             is_divergence = ratio < 0.7 and b_near_zero
-            if a_area < 1 or c_area < 1:
+            if c_area < 1:
                 continue
             if is_divergence:
                 results.append({
@@ -430,7 +430,7 @@ def find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, close
     # 前提：近20天曾有价格在中枢内 → 跌破ZD → 回抽不破ZD
     # ================================================================
     if len(pivots) >= 1 and len(closes) >= 10:
-        pivot_in_range = any(last_pivot['zd'] <= c <= last_pivot['zg'] for c in closes[-40:])
+        pivot_in_range = any(last_pivot['zd'] <= c <= last_pivot['zg'] for c in closes[-20:])
         if pivot_in_range and current_price < last_pivot['zd']:
             recent_highs = max(closes[-5:])
             if recent_highs <= last_pivot['zd']:
