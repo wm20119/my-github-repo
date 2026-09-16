@@ -1,0 +1,41 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.env
+.env.local
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Secrets
+*.pem
+*.key
+credentials.json
+secrets.yaml
+
+# Large files
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# Temp
+*.tmp
+*.temp
+*.bak
