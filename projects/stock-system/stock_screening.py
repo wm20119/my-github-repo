@@ -5,12 +5,12 @@ stock-scorer粗筛(≥50分) → 缠论历史胜率精筛(A/B级+三买信号)
 输出：两道关都过的候选票
 """
 import sys, os, json, time, tempfile
-import argparse
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
-from kline_cache import fetch_kline
+from kline_db import init_db, get_latest_date, upsert_klines, get_klines
 from chanlun_strategy import (
     WINDOW, evaluate_chanlun_quality, scan_recent_signals,
 )
+from stock_whitelist import get_whitelist
 
 def atomic_json_dump(data, path):
     """原子写入JSON文件：先写临时文件，再rename"""
@@ -21,9 +21,9 @@ def atomic_json_dump(data, path):
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp_path, path)
-    except:
+    except Exception:
         try: os.unlink(tmp_path)
-        except: pass
+        except Exception: pass
         raise
 
 # 股票池：从stock_config.json统一读取
@@ -40,108 +40,101 @@ def load_pool_codes():
 
 POOL_CODES = load_pool_codes()
 
-def get_all_a_stocks():
-    """获取全A股列表（带缓存）"""
-    cache_file = os.path.expanduser('~/.hermes/scripts/cache/all_a_stocks.json')
-    if os.path.exists(cache_file):
-        mtime = os.path.getmtime(cache_file)
-        if time.time() - mtime < 86400:  # 缓存1天有效
-            with open(cache_file) as f:
-                return json.load(f)
-    import akshare as ak
-    df = ak.stock_info_a_code_name()
-    stocks = [(row['code'], row['name']) for _, row in df.iterrows()]
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    with open(cache_file, 'w') as f:
-        json.dump(stocks, f, ensure_ascii=False)
-    return stocks
-
-def run_screening(skip_step1=False):
+def run_screening():
     from datetime import datetime
+    import sys
     now = datetime.now()
     report = []
     report.append(f"📊 全A股选股扫描 {now.strftime('%Y-%m-%d %H:%M')}")
-    report.append("流程: 全A股 → stock-scorer粗筛(≥50分) → 缠论精筛(A/B级+三买信号)")
+    report.append("流程: 全A股 → 缠论快筛(A/B级+三买信号) → stock-scorer评分(≥50分)")
     report.append("=" * 50)
 
-    # 1. 获取全A股
+    # 1. 获取股票列表（从白名单）
     try:
-        all_stocks = get_all_a_stocks()
-        # 过滤ST、退市、北交所(8/9开头)
-        candidates = [(c, n) for c, n in all_stocks
-                      if c not in POOL_CODES
-                      and not c.startswith('8') and not c.startswith('9')
-                      and 'ST' not in n and '退' not in n]
-        report.append(f"\n全A股: {len(all_stocks)}只 (排除股票池/ST/退市/北交所后{len(candidates)}只)")
+        whitelist = get_whitelist()
+        if whitelist:
+            candidates = [(c, '') for c in whitelist]
+            report.append(f"\n白名单: {len(whitelist)}只")
+            print(f"白名单: {len(whitelist)}只", flush=True)
+        else:
+            report.append(f"\n白名单为空，请先运行stock_whitelist.py")
+            return "\n".join(report)
     except Exception as e:
         report.append(f"获取股票列表失败: {e}")
         return "\n".join(report)
 
-    # 2. stock-scorer评分
-    import stock_scorer as ss
-    report.append(f"\n【Step 1】stock-scorer粗筛...")
-    scores = {}
-    fail_count = 0
-    step1_cache = os.path.expanduser('~/.hermes/cache/screening_step1_scores.json')
-    cache_fresh = False
-    cache_age = 0
-    if os.path.exists(step1_cache):
-        cache_age = time.time() - os.path.getmtime(step1_cache)
-        cache_fresh = cache_age < 7 * 86400  # 7天有效
-    if (skip_step1 or cache_fresh) and os.path.exists(step1_cache):
-        try:
-            with open(step1_cache) as f:
-                scores = json.load(f)
-            age_days = int(cache_age / 86400)
-            report.append(f"  从缓存加载: {len(scores)}只 (缓存{age_days}天前, {'有效' if cache_fresh else '已过期但强制使用'})")
-            fail_count = None  # 缓存模式不统计失败
-        except (json.JSONDecodeError, ValueError) as e:
-            report.append(f"  Step1缓存损坏，重新评分: {e}")
-            scores = {}
-            cache_fresh = False
-    else:
-        for i, (code, name) in enumerate(candidates):
-            if i % 50 == 0:
-                report.append(f"  评分进度: {i + 1}/{len(candidates)} (通过{len(scores)}只)")
-            try:
-                results = ss.analyze([code], skip_industry=True)
-                if results and results[0]['total'] >= 50:
-                    scores[code] = results[0]
-            except Exception:
-                fail_count += 1
-            time.sleep(0.3)
-        atomic_json_dump(scores, step1_cache)
-        report.append(f"  Step1结果已缓存")
-    if fail_count is not None:
-        report.append(f"  评分完成: {len(scores)}只通过(≥50分), {fail_count}只失败")
-    else:
-        report.append(f"  评分完成: {len(scores)}只通过(≥50分)")
-
-    # 3. 缠论质量精筛
-    report.append(f"\n【Step 2】缠论历史胜率精筛...")
-    chanlun_results = {}
-    for i, (code, score_info) in enumerate(scores.items()):
-        name = score_info.get('name', code)
-        if i % 10 == 0:
-            report.append(f"  缠论进度: {i + 1}/{len(scores)} (通过{len(chanlun_results)}只)")
-        kl = fetch_kline(code, 1000)
+    # 2. 缠论快筛（只读K线，速度快）
+    report.append(f"\n【Step 1】缠论快筛（A/B级+三买信号）...")
+    
+    # 初始化K线数据库
+    init_db()
+    
+    chanlun_candidates = {}
+    for i, (code, name) in enumerate(candidates):
+        if i % 100 == 0:
+            report.append(f"  缠论进度: {i + 1}/{len(candidates)} (通过{len(chanlun_candidates)}只)")
+        
+        # 从数据库读取K线数据（不更新，直接读）
+        kl = get_klines(code)
         if not kl or not isinstance(kl, list) or len(kl) < WINDOW + 100:
             continue
+        
         stats = evaluate_chanlun_quality(kl, name, code)
         if stats and stats['quality'] in ('A', 'B') and stats['total_trades'] >= 5:
-            # 检查最近2天是否有三买信号
-            recent_sigs = scan_recent_signals(kl, name, code, lookback=2)
-            if not recent_sigs:
-                continue
+            # 检查最近1天是否有三买信号
+            recent_sigs = scan_recent_signals(kl, name, code, lookback=1)
+            if recent_sigs:
+                chanlun_candidates[code] = {
+                    'name': name,
+                    'chanlun': stats,
+                    'kl': kl,
+                }
+    
+    report.append(f"  缠论快筛完成: {len(chanlun_candidates)}只通过(A/B级+三买信号)")
+    
+    if not chanlun_candidates:
+        report.append("\n无候选票。")
+        report.append("\n" + "=" * 50)
+        report.append(f"🎯 候选股（两道关都过）: 0只")
+        report.append("=" * 50)
+        return "\n".join(report)
+    
+    # 3. 对A/B级股票进行stock-scorer评分
+    report.append(f"\n【Step 2】stock-scorer评分（仅{len(chanlun_candidates)}只）...")
+    
+    import stock_scorer as ss
+    scores = {}
+    
+    # 批量调用analyze，每50只一批
+    chanlun_codes = list(chanlun_candidates.keys())
+    batch_size = 50
+    
+    for batch_start in range(0, len(chanlun_codes), batch_size):
+        batch_codes = chanlun_codes[batch_start:batch_start + batch_size]
+        report.append(f"  评分进度: {batch_start + len(batch_codes)}/{len(chanlun_codes)}")
+        
+        try:
+            results = ss.analyze(batch_codes, skip_industry=True, skip_trends=True)
+            for r in results:
+                if r['total'] >= 50:
+                    scores[r['code']] = r
+        except Exception as e:
+            report.append(f"  批次错误: {e}")
+        
+        time.sleep(0.5)
+    
+    report.append(f"  评分完成: {len(scores)}只通过(≥50分)")
+    
+    # 4. 合并结果
+    chanlun_results = {}
+    for code in scores:
+        if code in chanlun_candidates:
             chanlun_results[code] = {
-                'score': score_info,
-                'chanlun': stats,
+                'score': scores[code],
+                'chanlun': chanlun_candidates[code]['chanlun'],
                 'has_signal': True,
-                'kl': kl,
+                'kl': chanlun_candidates[code]['kl'],
             }
-        time.sleep(0.1)
-
-    report.append(f"  精筛完成: {len(chanlun_results)}只通过(A/B级)")
 
     # 4. 输出结果
     if not chanlun_results:
@@ -225,7 +218,4 @@ def run_screening(skip_step1=False):
     return "\n".join(report)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--skip-step1', action='store_true', help='跳过Step1评分（用缓存）')
-    args = parser.parse_args()
-    print(run_screening(skip_step1=args.skip_step1))
+    print(run_screening())

@@ -256,10 +256,17 @@ def find_trend_structure(pivots, segments, diff, dea, macd_hist, closes, daily_d
         c_start_idx = date_to_idx.get(p2['end_date'], len(closes) - 1)
         c_end_idx = len(closes) - 1
 
-        # B段：p1的最后一个线段（中枢区域）
-        b_seg = p1['segments'][-1]
-        b_start_idx = date_to_idx.get(b_seg['start_date'], a_end_idx)
-        b_end_idx = date_to_idx.get(b_seg['end_date'], c_start_idx)
+        # B段：p1结束到p2开始之间的所有走势段
+        p1_end_date = p1['end_date']
+        p2_start_date = p2['start_date']
+        b_segments = [seg for seg in segments
+                      if seg['end_date'] >= p1_end_date and seg['start_date'] <= p2_start_date]
+        if b_segments:
+            b_start_idx = date_to_idx.get(b_segments[0]['start_date'], a_end_idx)
+            b_end_idx = date_to_idx.get(b_segments[-1]['end_date'], c_start_idx)
+        else:
+            b_start_idx = a_end_idx
+            b_end_idx = c_start_idx
 
         a_start_idx = max(0, min(a_start_idx, len(closes) - 1))
         a_end_idx = max(0, min(a_end_idx, len(closes) - 1))
@@ -376,7 +383,26 @@ def find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, close
     has_buy_signal = any(bp['type'] == '第一类买点' for bp in points)
     if has_buy_signal and bottom_fractals:
         last_bot = bottom_fractals[-1]
-        if (current_price > last_bot['price'] * 1.02 and
+        # 回调验证：从一买到当前，价格曾回落到前低1.05倍以内
+        pullback_confirmed = False
+        if points:
+            first_buy = next((bp for bp in points if bp['type'] == '第一类买点'), None)
+            if first_buy:
+                buy_idx = None
+                for idx in range(len(closes) - 1, -1, -1):
+                    if abs(closes[idx] - first_buy['price']) / first_buy['price'] < 0.01:
+                        buy_idx = idx
+                        break
+                if buy_idx is not None:
+                    high_after_buy = max(closes[buy_idx:])
+                    low_after_buy = min(closes[buy_idx:])
+                    # 从高点回调至少5%，且回落点在前低1.05倍以内
+                    if high_after_buy > 0:
+                        pullback_pct = (high_after_buy - low_after_buy) / high_after_buy
+                        if pullback_pct >= 0.05 and low_after_buy <= last_bot['price'] * 1.05:
+                            pullback_confirmed = True
+        if (pullback_confirmed and
+            current_price > last_bot['price'] * 1.02 and
             current_diff > current_dea):
             points.append({
                 'type': '第二类买点', 'direction': 'buy',

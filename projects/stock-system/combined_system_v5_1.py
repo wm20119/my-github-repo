@@ -18,7 +18,11 @@ def main():
 
     # 获取全A列表
     print("获取股票列表...")
-    import stock_scorer as ss
+    try:
+        import stock_scorer as ss
+    except ImportError:
+        print("stock_scorer导入失败，跳过评分筛选")
+        ss = None
     try:
         import akshare as ak
         df = ak.stock_info_a_code_name()
@@ -35,13 +39,15 @@ def main():
     else:
         sample = valid[:300] if valid else []
 
-    # 股票池从stock_config.json读取
+    # 股票池从stock_config.json的stocks字段读取
     import json as _json
     _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
     try:
         with open(_cfg_path) as _f:
             _cfg = _json.load(_f)
-        pool = [(c['code'], c['name']) for c in _cfg.get('stock_pool', [])]
+        _STOCK_NAMES = {'600030': '中信证券', '688019': '安集科技', '688008': '澜起科技',
+                        '600584': '长电科技', '300750': '宁德时代', '000977': '浪潮信息', '002156': '通富微电'}
+        pool = [(c, _STOCK_NAMES.get(c, c)) for c in _cfg.get('stocks', [])]
     except Exception:
         pool = [('600030', '中信证券'), ('688019', '安集科技'), ('688008', '澜起科技'),
                 ('600584', '长电科技'), ('300750', '宁德时代'), ('000977', '浪潮信息'),
@@ -83,7 +89,9 @@ def main():
           f"C级: {grades.get('C', {}).get('count', 0)}只  D级: {grades.get('D', {}).get('count', 0)}只")
 
     MIN_QUALITY = ('A', 'B')
-    passed_ch = {c: cs for c, cs in chanlun_stats.items() if cs['quality'] in MIN_QUALITY}
+    MIN_TRADES = 5  # 与stock_screening一致，避免偶然性高的票
+    passed_ch = {c: cs for c, cs in chanlun_stats.items()
+                 if cs['quality'] in MIN_QUALITY and cs['total_trades'] >= MIN_TRADES}
     print(f"  第一关通过(缠论{MIN_QUALITY}): {len(passed_ch)}只")
 
     # 显示通过的票
@@ -102,6 +110,8 @@ def main():
         if i % 10 == 0:
             print(f"  评分进度: {i + 1}/{len(passed_ch)}")
         try:
+            if ss is None:
+                continue
             r = ss.analyze([code], skip_industry=True)
             if r:
                 scores[code] = r[0]

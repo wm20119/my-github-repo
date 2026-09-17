@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
 from kline_cache import fetch_kline
 from chanlun_strategy import (
     WINDOW, COOLDOWN_DAYS,
-    check_entry_signal, check_exit_signal,
+    check_entry_signal, check_exit_signal, precompute,
 )
 from datetime import datetime
 
@@ -36,9 +36,9 @@ def save_portfolio(pf):
         with os.fdopen(fd, 'w') as f:
             json.dump(pf, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, PORTFOLIO_FILE)
-    except:
+    except Exception:
         try: os.unlink(tmp_path)
-        except: pass
+        except Exception: pass
         raise
 
 def load_nav():
@@ -54,9 +54,9 @@ def save_nav(nav):
         with os.fdopen(fd, 'w') as f:
             json.dump(nav, f, ensure_ascii=False)
         os.replace(tmp_path, NAV_FILE)
-    except:
+    except Exception:
         try: os.unlink(tmp_path)
-        except: pass
+        except Exception: pass
         raise
 
 def load_backup_pool():
@@ -85,24 +85,17 @@ def run():
     sold = []
     remaining = []
     for pos in pf['positions']:
-        # 计算持仓天数（即使K线获取失败也要递增，避免永久滞留）
-        if pos.get('last_update') != today:
-            # 只在交易日递增（跳过周末）
-            import datetime as _dt
-            today_dt = _dt.datetime.strptime(today, '%Y-%m-%d')
-            if today_dt.weekday() < 5:  # 0-4=周一至周五
-                pos['hold_days'] = pos.get('hold_days', 0) + 1
-            pos['last_update'] = today
-        
         # K线获取失败计数
         if 'kline_fail_count' not in pos:
             pos['kline_fail_count'] = 0
         
         kl = fetch_kline(pos['code'], 500)
         time.sleep(0.3)
+        
         if not kl or len(kl) < WINDOW + 10:
             pos['kline_fail_count'] += 1
             pos['current_price'] = pos['entry_price']  # 保持旧价格
+            pos['market_value'] = pos['shares'] * pos['current_price']  # 同步更新市值
             # 连续失败5次强制退出（约5天无法获取数据）
             if pos['kline_fail_count'] >= 5:
                 pos['exit_date'] = today
@@ -125,13 +118,22 @@ def run():
         
         pos['kline_fail_count'] = 0  # 成功获取，重置失败计数
 
+        # 计算持仓天数（仅交易日递增，用K线判断是否交易日，兼容节假日）
+        if pos.get('last_update') != today:
+            kline_dates = {d['date'] for d in kl}
+            if today in kline_dates:
+                pos['hold_days'] = pos.get('hold_days', 0) + 1
+            pos['last_update'] = today
+
         pos['current_price'] = kl[-1]['close']
         pnl_pct = (pos['current_price'] - pos['entry_price']) / pos['entry_price']
         pos['pnl_pct'] = round(pnl_pct * 100, 2)
         pos['market_value'] = pos['shares'] * pos['current_price']
 
+        # 预计算指标，复用避免重复计算
+        _pc = precompute(kl)
         should_exit, reason = check_exit_signal(
-            kl, pos['entry_price'], pos['hold_days'], pos['name'], pos['code'])
+            kl, pos['entry_price'], pos['hold_days'], pos['name'], pos['code'], _pc=_pc)
 
         if should_exit:
             pos['exit_date'] = today
@@ -148,25 +150,17 @@ def run():
             sold.append(pos)
             # 止损冷却（使用交易日，与回测一致）
             if reason == '止损':
-                # 获取K线数据来计算交易日
-                from kline_cache import fetch_kline as _fk
-                pos_kl = _fk(pos['code'], 100)
-                if pos_kl:
-                    # 找到当前日期在K线中的位置
-                    today_idx = None
-                    for idx, bar in enumerate(pos_kl):
-                        if bar['date'] >= today:
-                            today_idx = idx
-                            break
-                    if today_idx is not None:
-                        cd_idx = min(today_idx + COOLDOWN_DAYS, len(pos_kl) - 1)
-                        pf['cooldown_until'] = pos_kl[cd_idx]['date']
-                    else:
-                        # 如果找不到日期，fallback到7个日历天
-                        from datetime import timedelta
-                        pf['cooldown_until'] = (now + timedelta(days=COOLDOWN_DAYS + 2)).strftime('%Y-%m-%d')
+                # 复用已拉取的K线数据计算冷却到期日（避免冗余API调用）
+                today_idx = None
+                for idx, bar in enumerate(kl):
+                    if bar['date'] >= today:
+                        today_idx = idx
+                        break
+                if today_idx is not None:
+                    cd_idx = min(today_idx + COOLDOWN_DAYS, len(kl) - 1)
+                    pf['cooldown_until'] = kl[cd_idx]['date']
                 else:
-                    # 如果获取K线失败，fallback到7个日历天
+                    # 找不到日期时fallback到日历天
                     from datetime import timedelta
                     pf['cooldown_until'] = (now + timedelta(days=COOLDOWN_DAYS + 2)).strftime('%Y-%m-%d')
             # 清除去重记录（检查pivot_zg是否存在）

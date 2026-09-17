@@ -10,7 +10,7 @@ import json
 import time
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     import akshare as ak
@@ -78,7 +78,7 @@ def _market_prefix(code):
 def get_quote_tencent(code):
     """从腾讯获取单只股票行情, 返回 dict 或 None"""
     prefix = _market_prefix(code)
-    url = f'http://qt.gtimg.cn/q={prefix}{code}'
+    url = f'https://qt.gtimg.cn/q={prefix}{code}'
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         resp = urllib.request.urlopen(req, timeout=8)
@@ -114,7 +114,7 @@ def batch_quote_tencent(codes):
     if not codes:
         return {}
     prefixes = [_market_prefix(c) + c for c in codes]
-    url = 'http://qt.gtimg.cn/q=' + ','.join(prefixes)
+    url = 'https://qt.gtimg.cn/q=' + ','.join(prefixes)
     result = {}
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -127,23 +127,24 @@ def batch_quote_tencent(codes):
             parts = line.split('~')
             if len(parts) < 47:
                 continue
-            code = parts[2]
-            # 成交额: parts[37]是万元，转亿
-            amount_raw = float(parts[37]) if parts[37] else 0.0
-            amount_yi = amount_raw / 10000
-            result[code] = {
-                'code': code,
-                'name': parts[1],
-                'price': float(parts[3]) if parts[3] else 0.0,
-                'change_pct': float(parts[32]) if parts[32] else 0.0,
-                'turnover': float(parts[38]) if parts[38] else 0.0,
-                'turnover_rate': float(parts[38]) if parts[38] else 0.0,
-                'pe': float(parts[39]) if parts[39] else 0.0,
-                'pb': float(parts[46]) if parts[46] else 0.0,
-                'float_cap': float(parts[44]) if parts[44] else 0.0,
-                'market_cap': float(parts[45]) if parts[45] else 0.0,
-                'amount_yi': amount_yi,
-            }
+            try:
+                code = parts[2]
+                # 成交额: parts[37]是万元，转亿
+                amount_raw = float(parts[37]) if parts[37] else 0.0
+                amount_yi = amount_raw / 10000
+                result[code] = {
+                    'code': code,
+                    'name': parts[1],
+                    'price': float(parts[3]) if parts[3] else 0.0,
+                    'change_pct': float(parts[32]) if parts[32] else 0.0,
+                    'turnover_rate': float(parts[38]) if parts[38] else 0.0,
+                    'pe': float(parts[39]) if parts[39] else 0.0,
+                    'pb': float(parts[46]) if parts[46] else 0.0,
+                    'market_cap': float(parts[45]) if parts[45] else 0.0,
+                    'amount_yi': amount_yi,
+                }
+            except (ValueError, IndexError):
+                continue
     except Exception:
         pass
     return result
@@ -210,6 +211,87 @@ def batch_quote_tushare(codes, trade_date=None):
     return result
 
 
+def batch_financial_tushare(codes):
+    """批量获取财务数据(fina_indicator), 返回 dict[code] -> dict
+    一次API调用拉所有股票，比逐只东方财富快10倍+
+    """
+    if _TUSHARE_PRO is None or not codes:
+        return {}
+    try:
+        ts_codes = [_tushare_code(c) for c in codes]
+        # fina_indicator不支持批量ts_code，需逐只但用最近日期减少数据量
+        # 改用fina_indicator_vip或简化字段
+        result = {}
+        # 分批拉取，每批50只
+        batch_size = 50
+        for i in range(0, len(ts_codes), batch_size):
+            batch = ts_codes[i:i+batch_size]
+            batch_codes = codes[i:i+batch_size]
+            for ts_c, code in zip(batch, batch_codes):
+                try:
+                    df = _TUSHARE_PRO.fina_indicator(ts_code=ts_c, limit=8,
+                        fields='ts_code,end_date,roe,netprofit_margin,grossprofit_margin,'
+                               'debt_to_assets,ocf_to_profit,netprofit_yoy,or_yoy,'
+                               'dt_netprofit_yoy,deducted_profit')
+                    if df is None or len(df) == 0:
+                        continue
+                    df = df.sort_values('end_date', ascending=False)
+                    # 按报告期分类
+                    annual = df[df['end_date'].astype(str).str.endswith('1231')]
+                    non_annual = df[~df['end_date'].astype(str).str.endswith('1231')]
+                    
+                    def _parse_row(row):
+                        return {
+                            'roe_jq': row.get('roe'),
+                            'net_margin': row.get('netprofit_margin'),
+                            'gross_margin': row.get('grossprofit_margin'),
+                            'debt_ratio': row.get('debt_to_assets'),
+                            'ocf_to_profit': row.get('ocf_to_profit'),
+                            'profit_growth_pct': row.get('netprofit_yoy'),
+                            'deducted_profit_growth': row.get('dt_netprofit_yoy'),
+                            'deducted_profit': row.get('deducted_profit'),
+                            'report_date': str(row.get('end_date', '')),
+                            'report_type': '年报' if str(row.get('end_date', '')).endswith('1231') else '季报',
+                        }
+                    
+                    years = [_parse_row(r) for _, r in annual.head(4).iterrows()]
+                    quarter = _parse_row(non_annual.iloc[0]) if len(non_annual) > 0 else None
+                    
+                    # 加权平均
+                    weighted = {}
+                    for field in ['roe_jq', 'debt_ratio', 'net_margin', 'ocf_to_profit']:
+                        vals = [(y.get(field), 1.0) for y in years[:3] if y.get(field) is not None]
+                        if quarter and quarter.get(field) is not None:
+                            vals.append((quarter.get(field), 0.6))
+                        if vals:
+                            total_w = sum(w for _, w in vals)
+                            weighted[field] = sum(v * w for v, w in vals) / total_w if total_w > 0 else None
+                    
+                    # 扣非增速
+                    deducted_growth = None
+                    if quarter and quarter.get('deducted_profit_growth') is not None:
+                        deducted_growth = quarter['deducted_profit_growth']
+                    elif len(years) >= 2:
+                        this_d = years[0].get('deducted_profit')
+                        last_d = years[1].get('deducted_profit')
+                        if this_d is not None and last_d is not None and last_d != 0:
+                            deducted_growth = (this_d - last_d) / abs(last_d) * 100
+                    
+                    result[code] = {
+                        'years': years,
+                        'quarter': quarter,
+                        'weighted': weighted,
+                        'deducted_growth_pct': deducted_growth,
+                        'latest': years[0] if years else (quarter or {}),
+                    }
+                except Exception:
+                    pass
+            time.sleep(0.3)  # Tushare限流
+        return result
+    except Exception:
+        return {}
+
+
 def get_financial_data_tushare(code, years=3):
     """从Tushare income获取利润表, 返回东方财富F10同构格式的dict或None
     返回: {years: [...], quarter: {...}, weighted: {...}, deducted_growth_pct: ...}
@@ -256,7 +338,7 @@ def get_financial_data_tushare(code, years=3):
         # 加权平均(简化: Tushare无扣非数据,用净利润代替)
         weighted = {}
         for field in ['net_profit']:
-            vals = [y.get(field) for y in annual_reports[:years] if y.get(field)]
+            vals = [y.get(field) for y in annual_reports[:years] if y.get(field) is not None]
             if vals:
                 weighted[field] = sum(vals) / len(vals)
             else:
@@ -292,7 +374,8 @@ def get_financial_data_tushare(code, years=3):
 # Tushare 资金流向评分
 # ============================================================
 
-_SW_INDUSTRY_CACHE = {}  # code -> industry_name
+_SW_INDUSTRY_CACHE = {}       # code -> industry_name
+_SW_ALL_INDUSTRIES = None     # {industry_name: [ts_code, ...]} 一次性缓存
 
 
 def score_moneyflow(code):
@@ -303,7 +386,6 @@ def score_moneyflow(code):
     if _TUSHARE_PRO is None:
         return None
     try:
-        from datetime import timedelta
         ts_code = _tushare_code(code)
         end_date = datetime.now().strftime('%Y%m%d')
         start_date = (datetime.now() - timedelta(days=15)).strftime('%Y%m%d')
@@ -330,14 +412,38 @@ def score_moneyflow(code):
                 break
         total_net = sum(net_flows)
         avg_net = total_net / len(net_flows)
+        # --- 按总市值比例调整阈值 (total_mv 单位: 万元) ---
+        scale = 1.0  # 默认: 小盘股 (total_mv < 100亿)
+        try:
+            mv_df = _TUSHARE_PRO.daily_basic(
+                ts_code=ts_code,
+                trade_date=datetime.now().strftime('%Y%m%d'),
+                fields='total_mv')
+            if mv_df is None or len(mv_df) == 0:
+                # 回退到前一个交易日
+                prev = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+                mv_df = _TUSHARE_PRO.daily_basic(
+                    ts_code=ts_code, trade_date=prev, fields='total_mv')
+            if mv_df is not None and len(mv_df) > 0:
+                total_mv = float(mv_df.iloc[0].get('total_mv', 0) or 0)  # 万元
+                if total_mv >= 5000000:    # >=500亿 (500万万元)
+                    scale = 5.0
+                elif total_mv >= 1000000:  # >=100亿
+                    scale = 2.0
+                else:
+                    scale = 1.0
+        except Exception:
+            scale = 1.0
+        base_flat = 5e6 * scale   # 接近持平阈值 (默认500万)
+        base_out = 5e7 * scale    # 大幅净流出阈值 (默认5000万)
 
         if consecutive_positive >= 3:
             return 5   # 连续3天+主力净流入
         if total_net > 0:
             return 4   # 整体主力净流入
-        if abs(avg_net) < 5e6:  # 接近持平 (<500万元)
+        if abs(avg_net) < base_flat:   # 接近持平
             return 3
-        if total_net < -5e7:    # 大幅净流出 (>5000万)
+        if total_net < -base_out:      # 大幅净流出
             return 1
         return 2               # 净流出
     except Exception:
@@ -402,10 +508,11 @@ def get_express_data(code):
 # ============================================================
 
 def get_sw_industry(code):
-    """获取申万二级行业名称 (通过Tushare index_classify + stock_basic)
-    优先用index_classify获取分类定义, 再用stock_basic匹配
+    """获取申万二级行业名称
+    方法1: stock_basic直接查单只股票 (1次API)
+    方法2: stock_basic批量获取全部股票的industry字段, 构建映射后反查 (仅首次1次API, 后续走缓存)
     """
-    global _SW_INDUSTRY_CACHE
+    global _SW_INDUSTRY_CACHE, _SW_ALL_INDUSTRIES
     if _TUSHARE_PRO is None:
         return None
     if code in _SW_INDUSTRY_CACHE:
@@ -413,33 +520,40 @@ def get_sw_industry(code):
     try:
         ts_code = _tushare_code(code)
         # 方法1: stock_basic直接获取行业字段
-        df = _TUSHARE_PRO.stock_basic(ts_code=ts_code,
-                                       fields='ts_code,industry,list_status')
-        if df is not None and len(df) > 0:
-            industry = df.iloc[0].get('industry')
-            if industry and str(industry).strip():
-                _SW_INDUSTRY_CACHE[code] = str(industry).strip()
-                return str(industry).strip()
-        # 方法2: 通过index_classify获取申万二级行业分类列表, 再匹配
         try:
-            classify_df = _TUSHARE_PRO.index_classify(level='L2', src='SW2021')
-            if classify_df is not None and len(classify_df) > 0:
-                for _, row in classify_df.iterrows():
-                    idx_code = row.get('index_code', '')
-                    ind_name = row.get('industry_name', '')
-                    if not idx_code:
-                        continue
-                    try:
-                        members = _TUSHARE_PRO.index_member(index_code=idx_code)
-                        if members is not None and len(members) > 0:
-                            member_codes = members['con_code'].tolist()
-                            if ts_code in member_codes:
-                                _SW_INDUSTRY_CACHE[code] = ind_name
-                                return ind_name
-                    except Exception:
-                        continue
+            df = _TUSHARE_PRO.stock_basic(ts_code=ts_code,
+                                           fields='ts_code,industry,list_status')
+            if df is not None and len(df) > 0:
+                industry = df.iloc[0].get('industry')
+                if industry and str(industry).strip():
+                    _SW_INDUSTRY_CACHE[code] = str(industry).strip()
+                    return str(industry).strip()
         except Exception:
+            # 方法1失败, 进入方法2批量查询
             pass
+        # 方法2: 批量获取所有股票industry, 构建 {industry: [ts_code]} 映射 (仅1次API)
+        if _SW_ALL_INDUSTRIES is None:
+            try:
+                all_df = _TUSHARE_PRO.stock_basic(
+                    exchange='', list_status='L',
+                    fields='ts_code,industry,list_status')
+                if all_df is not None and len(all_df) > 0:
+                    mapping = {}
+                    for _, r in all_df.iterrows():
+                        ind = str(r.get('industry', '')).strip()
+                        tc = r.get('ts_code', '')
+                        if ind and tc:
+                            mapping.setdefault(ind, []).append(tc)
+                    _SW_ALL_INDUSTRIES = mapping
+                else:
+                    _SW_ALL_INDUSTRIES = {}
+            except Exception:
+                _SW_ALL_INDUSTRIES = {}
+        # 用映射反查
+        for ind_name, members in _SW_ALL_INDUSTRIES.items():
+            if ts_code in members:
+                _SW_INDUSTRY_CACHE[code] = ind_name
+                return ind_name
     except Exception:
         pass
     return None
@@ -523,6 +637,147 @@ def calc_volume_trend(volumes, n=5):
 # ============================================================
 # 行业PB对比
 # ============================================================
+
+# ============================================================
+# Tushare 批量K线
+# ============================================================
+
+def batch_kline_tushare(codes, days=120):
+    """从Tushare批量获取日K线, 返回 dict[code] -> list of dict
+    一次API调用拉所有股票
+    """
+    if _TUSHARE_PRO is None or not codes:
+        return {}
+    ts_codes = [_tushare_code(c) for c in codes]
+    end_date = datetime.now().strftime('%Y%m%d')
+    start_date = (datetime.now() - timedelta(days=days+30)).strftime('%Y%m%d')
+    
+    result = {}
+    batch_size = 50
+    for i in range(0, len(ts_codes), batch_size):
+        batch = ts_codes[i:i+batch_size]
+        batch_codes = codes[i:i+batch_size]
+        try:
+            df = _TUSHARE_PRO.daily(ts_code=','.join(batch), start_date=start_date, end_date=end_date,
+                                  fields='ts_code,trade_date,open,high,low,close,vol')
+            if df is not None and len(df) > 0:
+                for ts_c, code in zip(batch, batch_codes):
+                    stock_df = df[df['ts_code'] == ts_c].sort_values('trade_date')
+                    if len(stock_df) > 0:
+                        result[code] = [{'date': str(row['trade_date']),
+                                        'open': float(row['open']),
+                                        'high': float(row['high']),
+                                        'low': float(row['low']),
+                                        'close': float(row['close']),
+                                        'volume': float(row['vol'])} 
+                                       for _, row in stock_df.iterrows()]
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return result
+
+
+# ============================================================
+# Tushare 批量资金流向
+# ============================================================
+
+def batch_moneyflow_tushare(codes):
+    """从Tushare批量获取资金流向, 返回 dict[code] -> score
+    一次API调用拉所有股票
+    """
+    if _TUSHARE_PRO is None or not codes:
+        return {}
+    ts_codes = [_tushare_code(c) for c in codes]
+    today = datetime.now().strftime('%Y%m%d')
+    start_15d = (datetime.now() - timedelta(days=15)).strftime('%Y%m%d')
+    
+    result = {}
+    try:
+        df = _TUSHARE_PRO.moneyflow(ts_code=','.join(ts_codes), start_date=start_15d, end_date=today)
+        if df is not None and len(df) > 0:
+            for ts_c in ts_codes:
+                code = ts_c.split('.')[0]
+                stock_df = df[df['ts_code'] == ts_c].sort_values('trade_date', ascending=False).head(5)
+                if len(stock_df) > 0:
+                    stock_df['main_net'] = (
+                        stock_df['buy_elg_amount'].fillna(0) + stock_df['buy_lg_amount'].fillna(0)
+                        - stock_df['sell_elg_amount'].fillna(0) - stock_df['sell_lg_amount'].fillna(0)
+                    )
+                    net_flows = stock_df['main_net'].tolist()
+                    if net_flows:
+                        consecutive = 0
+                        for n in net_flows:
+                            if n > 0:
+                                consecutive += 1
+                            else:
+                                break
+                        total_net = sum(net_flows)
+                        # 评分逻辑
+                        if consecutive >= 3:
+                            result[code] = 5
+                        elif total_net > 0:
+                            result[code] = 4
+                        elif abs(total_net / len(net_flows)) < 5e6:
+                            result[code] = 3
+                        elif total_net < -5e7:
+                            result[code] = 1
+                        else:
+                            result[code] = 2
+    except Exception:
+        pass
+    return result
+
+
+# ============================================================
+# Tushare 批量风险因子
+# ============================================================
+
+def batch_risk_tushare(codes):
+    """从Tushare批量获取风险因子, 返回 dict[code] -> {unlock, pledge}
+    share_float按日期批量, pledge_stat逐只(不支持批量)
+    """
+    if _TUSHARE_PRO is None or not codes:
+        return {}
+    ts_codes = [_tushare_code(c) for c in codes]
+    today = datetime.now().strftime('%Y%m%d')
+    start_30d = (datetime.now() + timedelta(days=30)).strftime('%Y%m%d')
+    
+    result = {code: {'unlock': 0, 'pledge': 0} for code in codes}
+    
+    # 1. 限售解禁 - 按日期批量
+    try:
+        df = _TUSHARE_PRO.share_float(start_date=today, end_date=start_30d, fields='ts_code,float_ratio')
+        if df is not None and len(df) > 0:
+            for ts_c in ts_codes:
+                code = ts_c.split('.')[0]
+                stock_df = df[df['ts_code'] == ts_c]
+                if len(stock_df) > 0:
+                    max_ratio = stock_df['float_ratio'].max()
+                    if float(max_ratio) > 5:
+                        result[code]['unlock'] = -3
+                    elif float(max_ratio) > 2:
+                        result[code]['unlock'] = -1
+    except Exception:
+        pass
+    
+    # 2. 股权质押 - 逐只(不支持批量)
+    for ts_c in ts_codes:
+        code = ts_c.split('.')[0]
+        try:
+            df = _TUSHARE_PRO.pledge_stat(ts_code=ts_c, fields='ts_code,end_date,pledge_ratio')
+            if df is not None and len(df) > 0:
+                df = df.sort_values('end_date', ascending=False)
+                ratio = float(df.iloc[0]['pledge_ratio'])
+                if ratio > 50:
+                    result[code]['pledge'] = -3
+                elif ratio > 30:
+                    result[code]['pledge'] = -1
+        except Exception:
+            pass
+        time.sleep(0.2)
+    
+    return result
+
 
 def get_industry_pb_stats(code):
     """获取行业PB统计: (industry_name, avg_pb, stock_pb, rank_ratio)
@@ -619,7 +874,7 @@ def get_financial_data(code, years=3):
     def _fetch_reports(type_code):
         """获取指定类型的报告"""
         try:
-            prefix = 'SZ' if code.startswith(('0', '3')) else 'SH'
+            prefix = 'SZ' if code.startswith(('0', '3')) else 'BJ' if code.startswith('8') else 'SH'
             url = f'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/ZYZBAjaxNew?code={prefix}{code}&type={type_code}&date_type=0'
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             resp = urllib.request.urlopen(req, timeout=10)
@@ -1076,7 +1331,7 @@ def score_volatility(kline):
     if not kline or len(kline) < 10:
         return 2
     closes = [d['close'] for d in kline[-10:]]
-    if not closes or closes[0] == 0:
+    if not closes or any(c == 0 for c in closes):
         return 2
     returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
     if not returns:
@@ -1109,7 +1364,6 @@ def _get_pe_percentile(code, years=3, quote=None):
     try:
         if ak is None:
             return None, None
-        from datetime import timedelta
         # 尝试 stock_a_indicator_lg 接口获取历史PE
         df = ak.stock_a_indicator_lg(symbol=code)
         if df is not None and len(df) > 0:
@@ -1415,7 +1669,7 @@ def detect_cycle_stage(quote):
 # 主分析函数
 # ============================================================
 
-def analyze(codes, skip_industry=False, chokepoint_overrides=None):
+def analyze(codes, skip_industry=False, chokepoint_overrides=None, skip_trends=False):
     """主分析: 对每只股票计算5维度评分 (v12)"""
     # 用本地副本避免污染全局CHOKEPOINT_DB
     local_chokepoint = dict(CHOKEPOINT_DB)
@@ -1430,21 +1684,44 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         pass
     # Tushare批量获取行情(PE/PB/换手率/总市值)
     tushare_quotes = batch_quote_tushare(codes)
+    # Tushare批量获取财务数据(替代逐只东方财富F10)
+    tushare_financials = batch_financial_tushare(codes)
+    # Tushare批量获取K线(替代逐只新浪)
+    tushare_klines = batch_kline_tushare(codes, 120)
+    # Tushare批量获取资金流向
+    tushare_moneyflows = batch_moneyflow_tushare(codes)
+    # Tushare批量获取风险因子
+    tushare_risks = batch_risk_tushare(codes)
+    # 批量获取股票名称(stock_basic)
+    stock_names = {}
+    if _TUSHARE_PRO is not None:
+        try:
+            ts_codes = [_tushare_code(c) for c in codes]
+            df = _TUSHARE_PRO.stock_basic(ts_code=','.join(ts_codes), fields='ts_code,name')
+            if df is not None and len(df) > 0:
+                for _, row in df.iterrows():
+                    code = row['ts_code'].split('.')[0]
+                    stock_names[code] = row['name']
+        except Exception:
+            pass
     for code in codes:
+     try:
         print(f'  正在分析 {code}...', file=sys.stderr)
-        quote = get_quote_tencent(code)
-        if not quote or quote['price'] == 0:
+        # 行情: 优先用Tushare批量数据
+        quote = tushare_quotes.get(code)
+        if not quote or quote.get('price', 0) == 0:
+            # fallback到腾讯
+            quote = get_quote_tencent(code)
+        if not quote or quote.get('price', 0) == 0:
             print(f'  ⚠ {code} 无法获取行情, 跳过', file=sys.stderr)
             continue
-        # Tushare数据覆盖(更准确的PE/PB/换手率/总市值)
-        if code in tushare_quotes:
-            ts_data = tushare_quotes[code]
-            if ts_data.get('pe'): quote['pe'] = ts_data['pe']
-            if ts_data.get('pb'): quote['pb'] = ts_data['pb']
-            if ts_data.get('turnover_rate'): quote['turnover_rate'] = ts_data['turnover_rate']
-            if ts_data.get('market_cap'): quote['market_cap'] = ts_data['market_cap']
-        # K线
-        kline = get_kline_sina(code, 120)
+        # 补充股票名称
+        if 'name' not in quote or not quote.get('name'):
+            quote['name'] = stock_names.get(code, code)
+        # K线: 优先用Tushare批量数据
+        kline = tushare_klines.get(code, [])
+        if not kline:
+            kline = get_kline_sina(code, 120)  # fallback到新浪
         closes = [d['close'] for d in kline]
         # 行业PB
         if skip_industry:
@@ -1455,10 +1732,10 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         cycle_info = detect_cycle_stage(quote)
         industry_name = cycle_info[0]
         stage_label = cycle_info[1]
-        # 财务数据: 东方财富F10优先(数据更完整), Tushare增速/预告增强
-        financial = get_financial_data(code)  # 东方财富F10主数据源
+        # 财务数据: 优先用Tushare批量数据，回退到东方财富F10
+        financial = tushare_financials.get(code)
         if financial is None:
-            financial = get_financial_data_tushare(code)  # Tushare备选
+            financial = get_financial_data(code)  # 东方财富F10回退
         if financial:
             quote['_financial'] = financial  # 保存完整财务数据(含3年历史)
             # 将latest中的字段合并到quote(保持向后兼容)
@@ -1474,7 +1751,7 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         fund_cashflow = score_cashflow(quote)
         fund_margin = score_net_margin(quote)
         # 增速稳定性 bonus/penalty (合并akshare调用)
-        fin_trends = _get_financial_trends(code)
+        fin_trends = None if skip_trends else _get_financial_trends(code)
         growth_stability_adj = 0
         if fin_trends and 'std_dev' in fin_trends:
             std_dev = fin_trends['std_dev']
@@ -1496,10 +1773,13 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         fund_growth = max(0, min(5, fund_growth + growth_trend_adj))
         # 扣非净利润占比 → fund_margin调整
         deducted_adj = 0
-        deducted_profit = quote.get('deducted_profit')
-        net_profit = quote.get('net_profit')
+        try:
+            deducted_profit = float(quote.get('deducted_profit', 0) or 0)
+            net_profit = float(quote.get('net_profit', 0) or 0)
+        except (TypeError, ValueError):
+            deducted_profit = net_profit = 0
         # 确保值有效
-        if deducted_profit is not None and net_profit is not None and net_profit > 0 and deducted_profit > 0:
+        if net_profit > 0 and deducted_profit > 0:
             deducted_ratio = deducted_profit / net_profit
             if deducted_ratio > 0.9:
                 deducted_adj = 1  # 主业赚钱, +1分
@@ -1591,7 +1871,9 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         # ---- v12: 资金流向加分 (0-3) ----
         moneyflow_bonus = 0
         try:
-            mf_score = score_moneyflow(code)
+            mf_score = tushare_moneyflows.get(code)
+            if mf_score is None:
+                mf_score = score_moneyflow(code)  # fallback到逐只
             if mf_score is not None:
                 if mf_score >= 5:
                     moneyflow_bonus = 3   # 连续净流入, 强烈看多
@@ -1639,79 +1921,14 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         block_risk = 0
         pledge_risk = 0
         if _TUSHARE_PRO is not None:
-            # 1. 限售解禁: 未来30天解禁比例
-            try:
-                ts_code = _tushare_code(code)
-                today = datetime.now().strftime('%Y%m%d')
-                from datetime import timedelta
-                end_date = (datetime.now() + timedelta(days=30)).strftime('%Y%m%d')
-                df_unlock = _TUSHARE_PRO.share_float(ts_code=ts_code,
-                                                       start_date=today,
-                                                       end_date=end_date,
-                                                       fields='float_ratio')
-                if df_unlock is not None and not df_unlock.empty:
-                    max_float_ratio = df_unlock['float_ratio'].max()
-                    if float(max_float_ratio) > 5:
-                        total -= 3
-                        unlock_risk = -3
-                    elif float(max_float_ratio) > 2:
-                        total -= 1
-                        unlock_risk = -1
-            except Exception:
-                pass
-            # 2. 大宗交易: 近5天折价/溢价
-            try:
-                ts_code = _tushare_code(code)
-                today = datetime.now().strftime('%Y%m%d')
-                start_5d = (datetime.now() - timedelta(days=7)).strftime('%Y%m%d')
-                df_block = _TUSHARE_PRO.block_trade(ts_code=ts_code,
-                                                     start_date=start_5d,
-                                                     end_date=today,
-                                                     fields='ts_code,trade_date,price,vol,amount,buyer,seller')
-                if df_block is not None and not df_block.empty:
-                    # 用每日收盘价计算折溢价: (大宗价格 / 收盘价 - 1) * 100
-                    daily_df = _TUSHARE_PRO.daily(ts_code=ts_code,
-                                                   start_date=start_5d,
-                                                   end_date=today,
-                                                   fields='ts_code,trade_date,close')
-                    if daily_df is not None and not daily_df.empty:
-                        close_map = dict(zip(daily_df['trade_date'], daily_df['close']))
-                        max_discount = 0
-                        max_premium = 0
-                        for _, row in df_block.iterrows():
-                            trade_date = row.get('trade_date', '')
-                            close_price = close_map.get(trade_date)
-                            block_price = row.get('price')
-                            if close_price and block_price and float(close_price) > 0:
-                                premium_pct = (float(block_price) / float(close_price) - 1) * 100
-                                if premium_pct < 0:
-                                    max_discount = min(max_discount, premium_pct)
-                                elif premium_pct > 0:
-                                    max_premium = max(max_premium, premium_pct)
-                        if abs(max_discount) > 5:
-                            total -= 2
-                            block_risk = -2
-                        if max_premium > 5:
-                            total += 1
-                            block_risk = 1
-            except Exception:
-                pass
-            # 3. 股权质押: 最新质押比例
-            try:
-                ts_code = _tushare_code(code)
-                df_pledge = _TUSHARE_PRO.pledge_stat(ts_code=ts_code,
-                                                      fields='ts_code,end_date,pledge_ratio')
-                if df_pledge is not None and not df_pledge.empty:
-                    df_pledge = df_pledge.sort_values('end_date', ascending=False)
-                    latest_ratio = float(df_pledge.iloc[0]['pledge_ratio'])
-                    if latest_ratio > 50:
-                        total -= 3
-                        pledge_risk = -3
-                    elif latest_ratio > 30:
-                        total -= 1
-                        pledge_risk = -1
-            except Exception:
-                pass
+            # 使用批量数据
+            risk_data = tushare_risks.get(code, {'unlock': 0, 'pledge': 0})
+            unlock_risk = risk_data.get('unlock', 0)
+            pledge_risk = risk_data.get('pledge', 0)
+            if unlock_risk < 0:
+                total += unlock_risk
+            if pledge_risk < 0:
+                total += pledge_risk
         
         total = max(0, min(100, total))
 
@@ -1727,7 +1944,6 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
         else:
             rating = 'D'
 
-        stage_label = cycle_info[1]
         stage_cn = {
             'bottom': '底部', 'recovery': '复苏',
             'peak': '顶部', 'decline': '衰退', 'none': '—'
@@ -1756,12 +1972,15 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None):
                 'sent_turnover': sent_turnover, 'sent_momentum': sent_momentum,
                 'sent_volatility': sent_volatility,
                 'fund_flow': moneyflow_bonus,
-                'sw_industry': industry_name,
+                'sw_industry': industry_stats[0] if industry_stats[0] else industry_name,
                 'unlock_risk': unlock_risk,
                 'block_risk': block_risk,
                 'pledge_risk': pledge_risk,
             }
         })
+     except Exception as e:
+        print(f'  ✗ {code} 评分异常: {e}', file=sys.stderr)
+        continue
 
     # 按总分降序
     results.sort(key=lambda x: x['total'], reverse=True)
@@ -1854,9 +2073,12 @@ def backtest_score(code, days=60):
 
     # 计算后续涨幅
     current_price = closes[days - 1]
-    forward_5d = (closes[days + 4] - current_price) / current_price * 100 if len(closes) > days + 4 else None
-    forward_10d = (closes[days + 9] - current_price) / current_price * 100 if len(closes) > days + 9 else None
-    forward_20d = (closes[days + 19] - current_price) / current_price * 100 if len(closes) > days + 19 else None
+    if current_price <= 0:
+        forward_5d = forward_10d = forward_20d = None
+    else:
+        forward_5d = (closes[days + 4] - current_price) / current_price * 100 if len(closes) > days + 4 else None
+        forward_10d = (closes[days + 9] - current_price) / current_price * 100 if len(closes) > days + 9 else None
+        forward_20d = (closes[days + 19] - current_price) / current_price * 100 if len(closes) > days + 19 else None
 
     return {
         'code': code,

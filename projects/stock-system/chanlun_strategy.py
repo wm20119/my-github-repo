@@ -105,6 +105,26 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
         ma20 = [sum(closes[max(0, idx - 19):idx + 1]) / min(20, idx + 1)
                 for idx in range(len(closes))]
 
+    p = klines[i]['close']
+
+    # ===== 快速前置过滤（不调full_analysis）=====
+    # 条件3: MACD diff > 0
+    if macd_all[i] <= 0:
+        return False, None
+    # 条件4: 价格 >= MA20
+    if p < ma20[i]:
+        return False, None
+    # 条件8: MACD柱连续3天上升
+    if i < 3 or i >= len(macd_all):
+        return False, None
+    if not (macd_all[i] > macd_all[i - 1] > macd_all[i - 2]):
+        return False, None
+    # 条件7: 价格 >= 近10天最高价
+    cl = closes[i - 9:i + 1] if i >= 9 else closes[:i + 1]
+    if p < max(cl):
+        return False, None
+
+    # ===== 慢条件（需full_analysis）=====
     window = klines[i - WINDOW:i]
     if len(window) < 30:
         return False, None
@@ -117,8 +137,6 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
         return False, None
 
     bs = [bp['type'] for bp in r['buy_sell_points'] if bp['direction'] == 'buy']
-    p = klines[i]['close']
-    cl = [d['close'] for d in window]
 
     # 条件1: 第三类买点
     if '第三类买点' not in bs:
@@ -126,26 +144,12 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
     # 条件2: score > 0
     if r['score'] <= 0:
         return False, None
-    # 条件3: MACD diff > 0（统一用macd_all，与条件8一致）
-    if macd_all[i] <= 0:
-        return False, None
-    # 条件4: 价格 >= MA20
-    if p < ma20[i]:
-        return False, None
     # 条件5: 有中枢
     if not r['pivots']:
         return False, None
     # 条件6: 价格 > ZG（中枢上沿）
     zg = r['pivots'][-1]['zg']
     if p <= zg:
-        return False, None
-    # 条件7: 价格 >= 近10天最高价
-    if p < max(cl[-10:]):
-        return False, None
-    # 条件8: MACD柱连续3天上升
-    if i < 3 or i >= len(macd_all):
-        return False, None
-    if not (macd_all[i] > macd_all[i - 1] > macd_all[i - 2]):
         return False, None
 
     return True, {
@@ -276,11 +280,11 @@ def evaluate_chanlun_quality(klines, name, code):
         quality = 'A'
     elif len(wins) == 0 and len(losses) >= 2:
         quality = 'D'
-    elif wr >= 60 and pf >= 1.5:
+    elif wr >= 80 and pf >= 2.0:
         quality = 'A'
-    elif wr >= 50 and pf >= 1.2:
+    elif wr >= 60 and pf >= 1.5:
         quality = 'B'
-    elif wr >= 40:
+    elif wr >= 50:
         quality = 'C'
     else:
         quality = 'D'
@@ -317,7 +321,7 @@ def scan_recent_signals(klines, name, code, lookback=30):
         r = ce.full_analysis(recent, name, code)
     except Exception:
         return []
-    if not r or not r['pivots'] or r['score'] <= 0 or r['diff'] <= 0:
+    if not r or not r['pivots'] or r['score'] <= 0:
         return []
 
     bs = [bp for bp in r['buy_sell_points']
@@ -340,15 +344,17 @@ def scan_recent_signals(klines, name, code, lookback=30):
                 and not (macd_all[i] > macd_all[i - 1] > macd_all[i - 2])):
             continue
         # 检查是否有第三类买点在此bar或之前出现
-        for bp in bs:
-            if p > zg and p >= max(cl_window[-10:]) and macd_all[i] > macd_all[i - 1] > macd_all[i - 2]:
-                above = (p - ma20[i]) / ma20[i] * 100 if ma20[i] > 0 else 0
-                vr = klines[i]['volume'] / vol_ma10[i] if vol_ma10[i] > 0 else 1
-                signals.append({
-                    'date': dates[i], 'price': p,
-                    'rsi': rsi_all[i], 'above_ma20': above, 'vol_ratio': vr,
-                })
-                break
+        # 检查是否满足入场条件（与check_entry_signal保持一致）
+        if (bs and p >= ma20[i] and p > zg
+                and p >= max(cl_window[-10:])
+                and macd_all[i] > 0
+                and macd_all[i] > macd_all[i - 1] > macd_all[i - 2]):
+            above = (p - ma20[i]) / ma20[i] * 100 if ma20[i] > 0 else 0
+            vr = klines[i]['volume'] / vol_ma10[i] if vol_ma10[i] > 0 else 1
+            signals.append({
+                'date': dates[i], 'price': p,
+                'rsi': rsi_all[i], 'above_ma20': above, 'vol_ratio': vr,
+            })
     return signals
 
 # ============================================================
