@@ -7,7 +7,7 @@
 """
 import sys, os, json, time
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
-from kline_cache import fetch_kline
+from kline_db import get_klines
 from chanlun_strategy import (
     WINDOW, COOLDOWN_DAYS,
     check_entry_signal, check_exit_signal, precompute,
@@ -95,7 +95,7 @@ def run():
         if 'kline_fail_count' not in pos:
             pos['kline_fail_count'] = 0
         
-        kl = fetch_kline(pos['code'], 500)
+        kl = get_klines(pos['code'], 500)
         time.sleep(0.3)
         
         if not kl or len(kl) < WINDOW + 10:
@@ -215,7 +215,7 @@ def run():
                 if any(p['code'] == code for p in pf['positions']):
                     continue
 
-                kl = fetch_kline(code, 500)
+                kl = get_klines(code, 500)
                 time.sleep(0.3)
                 if not kl:
                     continue

@@ -6,7 +6,7 @@
 import sys, os, json, time
 from datetime import datetime, timedelta
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
-from kline_cache import fetch_kline
+from kline_db import get_klines
 from chanlun_strategy import (
     WINDOW, evaluate_chanlun_quality, scan_recent_signals,
 )
@@ -103,7 +103,7 @@ def load_screening_results():
 def scan_one(code, name, today_klines=None):
     """扫描单只票，返回结果字典"""
     try:
-        kl = fetch_kline(code, 1000)
+        kl = get_klines(code, 1000)
         if not kl or len(kl) < WINDOW + 100:
             return None
 
