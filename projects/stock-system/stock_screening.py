@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 选股系统 v3.1 — 全A股扫描
-stock-scorer粗筛(≥50分) → 缠论历史胜率精筛(A/B级+三买信号)
+缠论历史胜率先筛(A/B级+三买信号) → stock-scorer评分把关
 输出：两道关都过的候选票
 """
 import sys, os, json, time, tempfile
@@ -70,25 +70,33 @@ def run_screening():
     init_db()
     
     chanlun_candidates = {}
+    chanlun_errors = 0
     for i, (code, name) in enumerate(candidates):
         if i % 100 == 0:
             report.append(f"  缠论进度: {i + 1}/{len(candidates)} (通过{len(chanlun_candidates)}只)")
-        
-        # 从数据库读取K线数据（不更新，直接读）
-        kl = get_klines(code)
-        if not kl or not isinstance(kl, list) or len(kl) < WINDOW + 100:
-            continue
-        
-        stats = evaluate_chanlun_quality(kl, name, code)
-        if stats and stats['quality'] in ('A', 'B') and stats['total_trades'] >= 5:
-            # 检查最近1天是否有三买信号
-            recent_sigs = scan_recent_signals(kl, name, code, lookback=1)
-            if recent_sigs:
-                chanlun_candidates[code] = {
-                    'name': name,
-                    'chanlun': stats,
-                    'kl': kl,
-                }
+        try:
+            # 从数据库读取K线数据（不更新，直接读）
+            kl = get_klines(code)
+            if not kl or not isinstance(kl, list) or len(kl) < WINDOW + 100:
+                continue
+            
+            stats = evaluate_chanlun_quality(kl, name, code)
+            if stats and stats['quality'] in ('A', 'B') and stats['total_trades'] >= 5:
+                # 检查最近1天是否有三买信号
+                recent_sigs = scan_recent_signals(kl, name, code, lookback=1)
+                if recent_sigs:
+                    chanlun_candidates[code] = {
+                        'name': name,
+                        'chanlun': stats,
+                        'kl': kl,
+                    }
+        except Exception as e:
+            chanlun_errors += 1
+            if chanlun_errors <= 5:
+                print(f"  ⚠️ {name}({code}) 缠论分析异常: {e}", file=sys.stderr)
+    
+    if chanlun_errors > 5:
+        report.append(f"  ⚠️ {chanlun_errors}只票缠论分析异常（仅显示前5条）")
     
     report.append(f"  缠论快筛完成: {len(chanlun_candidates)}只通过(A/B级+三买信号)")
     

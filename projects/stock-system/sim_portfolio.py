@@ -2,7 +2,7 @@
 """
 模拟盘跟踪系统 v3 — 调用chanlun_strategy公共模块
 入场：8层过滤（与回测/选股完全一致）
-出场：止损-5% / 止盈+8% / 超时60天 / 卖出信号+破位
+出场：止损-5% / 止盈+20% / 超时60天 / 卖出信号+破位
 冷却：止损后5天不买
 """
 import sys, os, json, time
@@ -24,8 +24,11 @@ POSITION_SIZE = 0.10
 
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
-        with open(PORTFOLIO_FILE) as f:
-            return json.load(f)
+        try:
+            with open(PORTFOLIO_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"  ⚠️ 模拟盘数据损坏，使用默认值: {e}", file=sys.stderr)
     return {'positions': [], 'cash': INITIAL_CAPITAL, 'trades': [],
             'used_pivots': [], 'cooldown_until': None}
 
@@ -43,8 +46,11 @@ def save_portfolio(pf):
 
 def load_nav():
     if os.path.exists(NAV_FILE):
-        with open(NAV_FILE) as f:
-            return json.load(f)
+        try:
+            with open(NAV_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception):
+            pass
     return []
 
 def save_nav(nav):
@@ -74,7 +80,7 @@ def run():
     today = now.strftime('%Y-%m-%d')
     report = []
     report.append(f"📊 模拟盘 {today}")
-    report.append(f"规则: 三买8层过滤入场 | 止盈+8%/止损-5%/超时60天 | 100万×10只×10%")
+    report.append(f"规则: 三买8层过滤入场 | 止盈+20%/止损-5%/超时60天 | 100万×10只×10%")
     report.append("=" * 50)
 
     pf = load_portfolio()
@@ -137,14 +143,24 @@ def run():
 
         if should_exit:
             pos['exit_date'] = today
-            pos['exit_price'] = pos['current_price']
+            # 止损用触发价（entry*1.05），其他用收盘价
+            if reason == '止损':
+                from chanlun_strategy import STOP_LOSS
+                pos['exit_price'] = pos['entry_price'] * (1 + STOP_LOSS)
+            else:
+                pos['exit_price'] = pos['current_price']
             pos['exit_reason'] = reason
-            pf['cash'] += pos['market_value']
+            # 止损用触发价计算回收资金，其他用市价
+            if reason == '止损':
+                pf['cash'] += pos['shares'] * pos['exit_price']
+            else:
+                pf['cash'] += pos['market_value']
             pf['trades'].append({
                 'code': pos['code'], 'name': pos['name'],
                 'entry_date': pos['entry_date'], 'entry_price': pos['entry_price'],
-                'exit_date': today, 'exit_price': pos['current_price'],
-                'pnl_pct': pos['pnl_pct'], 'reason': reason,
+                'exit_date': today, 'exit_price': pos['exit_price'],
+                'pnl_pct': round((pos['exit_price'] - pos['entry_price']) / pos['entry_price'] * 100, 2),
+                'reason': reason,
                 'hold_days': pos['hold_days'],
             })
             sold.append(pos)

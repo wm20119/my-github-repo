@@ -62,8 +62,8 @@ def fetch_today_klines(codes):
                         'close': float(r['close']),
                         'volume': float(r['vol']),
                     }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠️ Tushare批量拉取失败: {e}", file=sys.stderr)
     return result
 
 # 股票池名称映射（从stock_config.json的stocks字段读取7只）
@@ -139,7 +139,8 @@ def scan_one(code, name, today_klines=None):
             'has_signal': bool(recent),
             'signal': recent[-1] if recent else None,
         }
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ {name}({code}) 扫描失败: {e}", file=sys.stderr)
         return None
 
 def run_scan():

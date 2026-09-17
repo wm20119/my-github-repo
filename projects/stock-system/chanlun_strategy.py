@@ -4,7 +4,7 @@
 所有股票脚本共用的入场/出场/冷却/回测逻辑，改一处全生效。
 
 常量：
-  WINDOW=180, TAKE_PROFIT=+8%, STOP_LOSS=-5%, MAX_HOLD=60天, COOLDOWN=5天
+  WINDOW=180, TAKE_PROFIT=+20%, STOP_LOSS=-5%, MAX_HOLD=60天, COOLDOWN=5天
 
 函数：
   calc_rsi            - RSI计算
@@ -23,7 +23,7 @@ import chanlun_engine as ce
 # 常量
 # ============================================================
 WINDOW = 180
-TAKE_PROFIT = 0.08     # 止盈+8%
+TAKE_PROFIT = 0.20     # 止盈+20%
 STOP_LOSS = -0.05      # 止损-5%
 MAX_HOLD_DAYS = 60     # 最长持仓60天
 COOLDOWN_DAYS = 5      # 止损后冷却5天
@@ -301,6 +301,7 @@ def evaluate_chanlun_quality(klines, name, code):
 def scan_recent_signals(klines, name, code, lookback=30):
     """
     扫描最近lookback根K线，返回所有三买信号。
+    与check_entry_signal条件完全一致（per-bar full_analysis）。
     返回: [{'date','price','rsi','above_ma20','vol_ratio'}, ...]
     """
     if len(klines) < WINDOW + 10:
@@ -313,48 +314,45 @@ def scan_recent_signals(klines, name, code, lookback=30):
     rsi_all = calc_rsi(closes)
     ma20 = pc['ma20']
     vol_ma10 = pc['vol_ma10']
-
-    # v3.6优化：只做一次full_analysis，然后逐bar检查买卖点是否在lookback窗口内
-    start_idx = max(WINDOW, len(klines) - lookback)
-    recent = klines[start_idx - WINDOW:]  # 包含分析所需历史
-    try:
-        r = ce.full_analysis(recent, name, code)
-    except Exception:
-        return []
-    if not r or not r['pivots'] or r['score'] <= 0:
-        return []
-
-    bs = [bp for bp in r['buy_sell_points']
-          if bp['type'] == '第三类买点' and bp['direction'] == 'buy']
-    if not bs:
-        return []
-
-    zg = r['pivots'][-1]['zg']
     macd_all = pc['macd_all']
+
+    start_idx = max(WINDOW, len(klines) - lookback)
     signals = []
     for i in range(start_idx, len(klines)):
-        if i < 3 or i >= len(macd_all):
-            continue
         p = klines[i]['close']
-        cl_window = [d['close'] for d in klines[i - WINDOW:i]]
-        if (len(cl_window) >= 10
-                and p < ma20[i]
-                and p <= zg
-                and p < max(cl_window[-10:])
-                and not (macd_all[i] > macd_all[i - 1] > macd_all[i - 2])):
+        # 快速前置过滤（与check_entry_signal一致）
+        if macd_all[i] <= 0:
             continue
-        # 检查是否有第三类买点在此bar或之前出现
-        # 检查是否满足入场条件（与check_entry_signal保持一致）
-        if (bs and p >= ma20[i] and p > zg
-                and p >= max(cl_window[-10:])
-                and macd_all[i] > 0
-                and macd_all[i] > macd_all[i - 1] > macd_all[i - 2]):
-            above = (p - ma20[i]) / ma20[i] * 100 if ma20[i] > 0 else 0
-            vr = klines[i]['volume'] / vol_ma10[i] if vol_ma10[i] > 0 else 1
-            signals.append({
-                'date': dates[i], 'price': p,
-                'rsi': rsi_all[i], 'above_ma20': above, 'vol_ratio': vr,
-            })
+        if p < ma20[i]:
+            continue
+        if i < 3 or not (macd_all[i] > macd_all[i - 1] > macd_all[i - 2]):
+            continue
+        cl = closes[i - 9:i + 1] if i >= 9 else closes[:i + 1]
+        if p < max(cl):
+            continue
+        # 慢条件：per-bar full_analysis
+        window = klines[i - WINDOW:i]
+        if len(window) < 30:
+            continue
+        try:
+            r = ce.full_analysis(window, name, code)
+        except Exception:
+            continue
+        if not r or not r['pivots'] or r['score'] <= 0:
+            continue
+        bs = [bp for bp in r['buy_sell_points']
+              if bp['type'] == '第三类买点' and bp['direction'] == 'buy']
+        if not bs:
+            continue
+        zg = r['pivots'][-1]['zg']
+        if p <= zg:
+            continue
+        above = (p - ma20[i]) / ma20[i] * 100 if ma20[i] > 0 else 0
+        vr = klines[i]['volume'] / vol_ma10[i] if vol_ma10[i] > 0 else 1
+        signals.append({
+            'date': dates[i], 'price': p,
+            'rsi': rsi_all[i], 'above_ma20': above, 'vol_ratio': vr,
+        })
     return signals
 
 # ============================================================
