@@ -8,9 +8,19 @@
   --midday    14:50 盘中检查（出场+买入）+ 股票池扫描
   --summary   15:30 日报总结（只读）
 """
-import sys, os, json, time, argparse
+import sys, os, json, time, argparse, logging, shutil
 from datetime import datetime
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
+# 简单日志
+LOG_DIR = os.path.expanduser('~/.hermes/cache/logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[logging.FileHandler(os.path.join(LOG_DIR, 'stock_system.log'), encoding='utf-8')],
+)
+log = logging.getLogger('stock')
+
 
 from kline_db import get_klines
 from chanlun_strategy import (
@@ -384,19 +394,126 @@ def run_summary():
     report.extend(format_account(pf, nav_history))
     return "\n".join(report)
 
+
+def run_status():
+    """系统状态一览"""
+    lines = []
+    now = datetime.now()
+    lines.append("📊 股票系统状态 " + now.strftime('%Y-%m-%d %H:%M'))
+    lines.append("=" * 50)
+
+    from kline_db import init_db, get_stats
+    init_db()
+    stats = get_stats()
+    lines.append("")
+    lines.append("💾 K线数据库:")
+    lines.append("  股票数: " + str(stats.get('stock_count', '?')))
+    lines.append("  总行数: " + str(stats.get('total_rows', '?')))
+
+    pf = load_portfolio()
+    total_mv = sum(p['market_value'] for p in pf['positions'])
+    nav = pf['cash'] + total_mv
+    nav_pct = (nav - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+    lines.append("")
+    lines.append("💰 模拟盘:")
+    lines.append("  总资产: ¥{:,.0f} ({:+.1f}%)".format(nav, nav_pct))
+    lines.append("  现金: ¥{:,.0f}".format(pf['cash']))
+    lines.append("  持仓: {}/{}只".format(len(pf['positions']), MAX_POSITIONS))
+    for p in pf['positions']:
+        lines.append("    {}({}) {}股 {:+.1f}% 持{}天".format(
+            p['name'], p['code'], p['shares'], p['pnl_pct'], p['hold_days']))
+    if pf.get('cooldown_until'):
+        lines.append("  冷却期: 至" + pf['cooldown_until'])
+    if pf['trades']:
+        wins = len([t for t in pf['trades'] if t['pnl_pct'] > 0])
+        lines.append("  历史交易: {}笔 胜率{:.0f}%".format(
+            len(pf['trades']), wins/len(pf['trades'])*100))
+    nav_history = load_nav()
+    if nav_history:
+        lines.append("  净值: {}天 最新{:+.1f}%".format(
+            len(nav_history), nav_history[-1]['nav_pct']))
+
+    cache_file = os.path.expanduser('~/.hermes/cache/screening_latest.json')
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file) as f:
+                sc = json.load(f)
+            passed = sc.get('passed', {})
+            if passed:
+                lines.append("")
+                lines.append("📌 选股({}): {}只候选".format(sc.get('date',''), len(passed)))
+                for code, info in list(passed.items())[:3]:
+                    s = info.get('score', {})
+                    c = info.get('chanlun', {})
+                    lines.append("  {}({}) {}分 {}级".format(
+                        s.get('name',code), code, s.get('total',0), c.get('quality','?')))
+            else:
+                lines.append("")
+                lines.append("📌 选股({}): 无候选".format(sc.get('date','')))
+        except:
+            pass
+
+    log_file = os.path.join(LOG_DIR, 'stock_system.log')
+    if os.path.exists(log_file):
+        size = os.path.getsize(log_file)
+        lines.append("")
+        lines.append("📝 日志: {:.1f}KB".format(size/1024))
+        try:
+            with open(log_file, encoding='utf-8') as f:
+                all_lines = f.readlines()
+            errors = [l.strip() for l in all_lines if 'ERROR' in l][-5:]
+            if errors:
+                lines.append("  最近错误:")
+                for e in errors:
+                    lines.append("    " + e[:80])
+        except:
+            pass
+    return lines
+
+def run_backup():
+    """备份关键文件"""
+    backup_dir = os.path.expanduser('~/.hermes/cache/backups/' + datetime.now().strftime('%Y%m%d'))
+    os.makedirs(backup_dir, exist_ok=True)
+    files = {
+        'sim_portfolio.json': os.path.expanduser('~/.hermes/cache/sim_portfolio.json'),
+        'sim_nav.json': os.path.expanduser('~/.hermes/cache/sim_nav.json'),
+        'screening_latest.json': os.path.expanduser('~/.hermes/cache/screening_latest.json'),
+        'stock_config.json': os.path.expanduser('~/.hermes/scripts/stock_config.json'),
+    }
+    copied = []
+    for name, src in files.items():
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(backup_dir, name))
+            copied.append(name)
+    db_src = os.path.expanduser('~/.hermes/cache/kline.db')
+    if os.path.exists(db_src):
+        shutil.copy2(db_src, os.path.join(backup_dir, 'kline.db'))
+        copied.append('kline.db')
+    return ["✅ 备份完成: " + backup_dir, "  文件: " + ', '.join(copied)]
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='统一任务：模拟盘+股票池')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--morning', action='store_true', help='09:30 早盘买入+扫描')
     group.add_argument('--midday', action='store_true', help='14:50 盘中检查+扫描')
     group.add_argument('--summary', action='store_true', help='15:30 日报总结（只读）')
+    group.add_argument('--status', action='store_true', help='系统状态一览')
+    group.add_argument('--backup', action='store_true', help='备份关键文件')
     args = parser.parse_args()
 
-    if args.morning:
-        print(run_morning())
-    elif args.midday:
-        print(run_midday())
-    elif args.summary:
-        print(run_summary())
-    else:
-        print(run_morning())
+    try:
+        if args.morning:
+            print(run_morning())
+        elif args.midday:
+            print(run_midday())
+        elif args.summary:
+            print(run_summary())
+        elif args.status:
+            print('\n'.join(run_status()))
+        elif args.backup:
+            print('\n'.join(run_backup()))
+        else:
+            print(run_morning())
+    except Exception as e:
+        log.error('任务异常: ' + str(e))
+        raise
