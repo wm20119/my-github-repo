@@ -5,7 +5,6 @@ sync_stock_to_github.py
 用法：python3 sync_stock_to_github.py [--force]
 """
 import subprocess
-import os
 import sys
 import hashlib
 from pathlib import Path
