@@ -12,7 +12,7 @@ SQLite数据库存储所有股票的全部K线数据
 import sqlite3
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 DB_PATH = os.path.expanduser('~/.hermes/cache/kline.db')
 

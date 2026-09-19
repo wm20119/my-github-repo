@@ -8,7 +8,7 @@
   --midday    14:50 盘中检查（出场+买入）+ 股票池扫描
   --summary   15:30 日报总结（只读）
 """
-import sys, os, json, time, argparse, logging, shutil
+import sys, os, json, argparse, logging, shutil
 from datetime import datetime
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
 

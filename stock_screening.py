@@ -6,7 +6,7 @@
 """
 import sys, os, json, tempfile
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
-from kline_db import init_db, get_latest_date, upsert_klines, get_klines
+from kline_db import init_db, get_klines
 from chanlun_strategy import (
     WINDOW, evaluate_chanlun_quality, scan_recent_signals,
 )
