@@ -495,7 +495,7 @@ def run_status():
             else:
                 lines.append("")
                 lines.append("📌 选股({}): 无候选".format(sc.get('date','')))
-        except:
+        except Exception:
             pass
 
     # 交易日志
@@ -526,7 +526,7 @@ def run_status():
                 lines.append("  最近错误:")
                 for e in errors:
                     lines.append("    " + e[:80])
-        except:
+        except Exception:
             pass
     return lines
 
