@@ -12,7 +12,7 @@ SQLite数据库存储所有股票的全部K线数据
 import sqlite3
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 DB_PATH = os.path.expanduser('~/.hermes/cache/kline.db')
 
@@ -21,6 +21,7 @@ def get_conn():
     """获取数据库连接"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
     return conn
 
 
@@ -59,7 +60,7 @@ def get_klines(code, days=None):
     """
     conn = get_conn()
     try:
-        if days:
+        if days is not None:
             rows = conn.execute(
                 'SELECT * FROM klines WHERE code = ? ORDER BY date DESC LIMIT ?',
                 (code, days)

@@ -9,7 +9,7 @@ K线数据库更新脚本
   python update_kline_db.py --codes 600030 000001  # 更新多只
 """
 import sys, os, json, time
-sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 
 import urllib.request
 from datetime import datetime, timedelta

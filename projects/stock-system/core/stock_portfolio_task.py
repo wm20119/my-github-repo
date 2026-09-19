@@ -8,9 +8,16 @@
   --midday    14:50 盘中检查（出场+买入）+ 股票池扫描
   --summary   15:30 日报总结（只读）
 """
-import sys, os, json, time, argparse, logging, shutil
+import sys, os, json, argparse, logging, shutil
 from datetime import datetime
-sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'strategy'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'execution'))
+
+# 日志模块
+from stock_log import log_trade
+
 # 简单日志
 LOG_DIR = os.path.expanduser('~/.hermes/cache/logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -33,12 +40,31 @@ from sim_portfolio import (
     load_nav, save_nav,
     INITIAL_CAPITAL, MAX_POSITIONS,
 )
-import sim_portfolio as _sp
 
-# ========== Tushare 批量拉取当天K线（复用sim_portfolio的初始化）==========
+# ========== Tushare 初始化 ==========
+_TUSHARE_PRO = None
+def _init_tushare():
+    global _TUSHARE_PRO
+    if _TUSHARE_PRO is not None:
+        return
+    try:
+        import tushare as ts
+        token_path = os.path.expanduser('~/.tushare/token.txt')
+        if os.path.exists(token_path):
+            with open(token_path) as f:
+                token = f.read().strip()
+            if token:
+                _TUSHARE_PRO = ts.pro_api(token)
+    except Exception:
+        pass
+
 def _tushare_code(code):
     """股票代码 → ts_code"""
-    return _sp._tushare_code(code)
+    if code.startswith('8'):
+        return f'{code}.BJ'
+    if code.startswith(('6', '9')):
+        return f'{code}.SH'
+    return f'{code}.SZ'
 
 def _fetch_realtime_tencent(codes):
     """从腾讯行情API获取实时价格（盘中优先用这个）"""
@@ -92,8 +118,8 @@ def fetch_today_klines(codes):
             return {c: d for c, d in result.items() if d['date'] == today}
 
     # 收盘后或腾讯失败，用Tushare
-    _sp._init_tushare()
-    if _sp._TUSHARE_PRO is None:
+    _init_tushare()
+    if _TUSHARE_PRO is None:
         return {}
     ts_codes = [_tushare_code(c) for c in codes]
     result = {}
@@ -115,12 +141,12 @@ def fetch_today_klines(codes):
                         'volume': float(r['vol']),
                     }
     except Exception as e:
-        print(f"  ⚠️ Tushare批量拉取失败: {e}", file=sys.stderr)
+        log.error(f"Tushare批量拉取失败: {e}")
     return result
 
 # ========== 股票池 ==========
 import json as _json
-_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
+_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'stock_config.json')
 try:
     with open(_cfg_path) as _f:
         _cfg = _json.load(_f)
@@ -138,11 +164,17 @@ def load_screening_results():
     try:
         with open(cache_file) as f:
             data = json.load(f)
+        # 结构校验
+        if not isinstance(data, dict) or 'passed' not in data:
+            log.error(f"screening_latest.json结构异常: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            return []
+        # 时间校验：超过1天的数据不用
         data_date = data.get('date', '')
         if data_date:
             try:
                 data_dt = datetime.strptime(data_date, '%Y%m%d')
                 if (datetime.now() - data_dt).days > 1:
+                    log.info(f"screening数据过期: {data_date}")
                     return []
             except ValueError:
                 pass
@@ -181,7 +213,7 @@ def scan_one(code, name, today_klines=None):
             'signal': today_signal[-1] if today_signal else None,
         }
     except Exception as e:
-        print(f"  ⚠️ {name}({code}) 扫描失败: {e}", file=sys.stderr)
+        log.error(f"{name}({code}) 扫描失败: {e}")
         return None
 
 # ========== 模拟盘操作报告 ==========
@@ -330,6 +362,7 @@ def run_core(do_portfolio_ops=True):
         if pf['positions']:
             sold, remaining, stuck = do_exits(pf, today, now, report, today_klines=today_klines)
             pf['positions'] = remaining
+            save_portfolio(pf)  # 出场后立即保存，防止买入崩溃丢数据
         if pool:
             bought, skipped = do_buys(pf, pool, today, now, report, today_klines=today_klines)
         save_portfolio(pf)
@@ -337,14 +370,29 @@ def run_core(do_portfolio_ops=True):
     # 模拟盘操作报告
     report.extend(format_portfolio_ops(bought, sold, stuck, skipped))
 
+    # 交易日志写入SQLite
+    for b in bought:
+        log_trade(b['code'], b['name'], 'buy', b['entry_price'], b['shares'],
+                  pivot_zg=b.get('pivot_zg'), extra=b.get('chanlun_quality'))
+    for s in sold:
+        log_trade(s['code'], s['name'], 'sell', s['exit_price'], None,
+                  pnl_pct=s['pnl_pct'], reason=s['exit_reason'], hold_days=s['hold_days'])
+
     # 股票池扫描
     results = []
+    scan_errors = []
     for i, (code, name) in enumerate(all_stocks):
         if i % 5 == 0:
             report.append(f"\n  扫描进度: {i + 1}/{len(all_stocks)}")
         r = scan_one(code, name, today_klines)
         if r:
             results.append(r)
+        else:
+            scan_errors.append(f"{name}({code})")
+
+    # 扫描错误汇总记日志
+    if scan_errors:
+        log.error(f"扫描失败{len(scan_errors)}只: {', '.join(scan_errors[:5])}")
 
     report.extend(format_pool_scan(results, pool_codes))
 
@@ -407,7 +455,7 @@ def run_status():
     stats = get_stats()
     lines.append("")
     lines.append("💾 K线数据库:")
-    lines.append("  股票数: " + str(stats.get('stock_count', '?')))
+    lines.append("  股票数: " + str(stats.get('total_codes', '?')))
     lines.append("  总行数: " + str(stats.get('total_rows', '?')))
 
     pf = load_portfolio()
@@ -450,9 +498,24 @@ def run_status():
             else:
                 lines.append("")
                 lines.append("📌 选股({}): 无候选".format(sc.get('date','')))
-        except:
+        except Exception:
             pass
 
+    # 交易日志
+    from stock_log import get_recent_trades
+    trades = get_recent_trades(10)
+    if trades:
+        lines.append("")
+        lines.append("📝 最近交易:")
+        for t in trades:
+            ts, code, name, action, price, shares, pnl, reason, hold = t
+            act = '📥买' if action == 'buy' else '📤卖'
+            detail = f"¥{price:.2f}" if price else ""
+            if action == 'sell' and pnl is not None:
+                detail += f" {pnl:+.1f}% [{reason}] 持{hold}天"
+            lines.append(f"  {ts} {act} {name}({code}) {detail}")
+
+    # 错误日志
     log_file = os.path.join(LOG_DIR, 'stock_system.log')
     if os.path.exists(log_file):
         size = os.path.getsize(log_file)
@@ -466,7 +529,7 @@ def run_status():
                 lines.append("  最近错误:")
                 for e in errors:
                     lines.append("    " + e[:80])
-        except:
+        except Exception:
             pass
     return lines
 
@@ -478,7 +541,7 @@ def run_backup():
         'sim_portfolio.json': os.path.expanduser('~/.hermes/cache/sim_portfolio.json'),
         'sim_nav.json': os.path.expanduser('~/.hermes/cache/sim_nav.json'),
         'screening_latest.json': os.path.expanduser('~/.hermes/cache/screening_latest.json'),
-        'stock_config.json': os.path.expanduser('~/.hermes/scripts/stock_config.json'),
+        'stock_config.json': os.path.expanduser('~/.hermes/scripts/stock_system/data/stock_config.json'),
     }
     copied = []
     for name, src in files.items():
@@ -499,6 +562,7 @@ if __name__ == '__main__':
     group.add_argument('--summary', action='store_true', help='15:30 日报总结（只读）')
     group.add_argument('--status', action='store_true', help='系统状态一览')
     group.add_argument('--backup', action='store_true', help='备份关键文件')
+    group.add_argument('--trades', action='store_true', help='查看最近交易记录')
     args = parser.parse_args()
 
     try:
@@ -512,8 +576,25 @@ if __name__ == '__main__':
             print('\n'.join(run_status()))
         elif args.backup:
             print('\n'.join(run_backup()))
+        elif args.trades:
+            from stock_log import get_recent_trades
+            trades = get_recent_trades(20)
+            if not trades:
+                print("暂无交易记录")
+            else:
+                print(f"最近{len(trades)}笔交易:")
+                print("-" * 60)
+                for t in trades:
+                    ts, code, name, action, price, shares, pnl, reason, hold = t
+                    act = '📥买入' if action == 'buy' else '📤卖出'
+                    detail = f"¥{price:.2f}" if price else ""
+                    if action == 'sell' and pnl is not None:
+                        detail += f" {pnl:+.1f}% [{reason}] 持{hold}天"
+                    print(f"  {ts} {act} {name}({code}) {detail}")
         else:
             print(run_morning())
     except Exception as e:
-        log.error('任务异常: ' + str(e))
-        raise
+        error_msg = f'❌ 任务异常: {e}'
+        log.error(error_msg)
+        # 输出到stdout，cron会推微信
+        print(error_msg)

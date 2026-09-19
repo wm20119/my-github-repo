@@ -12,6 +12,20 @@
 """
 
 # ============================================================
+# 策略参数（原魔法数字）
+# ============================================================
+DIVERGENCE_RATIO = 0.7        # 背驰判定：C段面积/A段面积 < 此值
+NEAR_ZERO_THRESHOLD = 0.2     # MACD diff接近零判定：|diff| < max*此值
+PULLBACK_TOLERANCE = 1.05     # 回调不破前低容差倍数
+PULLBACK_MIN_PCT = 0.05       # 回调最小幅度（5%）
+PRICE_FILTER = 1.02           # 价格过滤：current > last_bot * 此值
+VOL_RATIO_BREAKOUT = 1.5      # 放量突破判定：量比 > 此值
+VOL_MA_WINDOW = 10            # 成交量均线窗口
+MACD_MA_SHORT = 12            # MACD快线周期
+MACD_MA_LONG = 26             # MACD慢线周期
+MACD_SIGNAL = 9               # MACD信号线周期
+
+# ============================================================
 # Part 1: K线包含关系处理
 # ============================================================
 
@@ -293,8 +307,8 @@ def find_trend_structure(pivots, segments, diff, dea, macd_hist, closes, daily_d
         if b_start_idx < b_end_idx:
             b_diff = diff[b_start_idx:b_end_idx + 1]
             if b_diff:
-                max_abs_diff = max(abs(d) for d in diff) if diff else 1
-                b_near_zero = any(abs(d) < max_abs_diff * 0.2 for d in b_diff)
+                max_abs_diff = max(abs(d) for d in b_diff) if b_diff else 1
+                b_near_zero = any(abs(d) < max_abs_diff * NEAR_ZERO_THRESHOLD for d in b_diff)
             else:
                 b_near_zero = False
         else:
@@ -302,7 +316,7 @@ def find_trend_structure(pivots, segments, diff, dea, macd_hist, closes, daily_d
 
         if a_area > 1:
             ratio = c_area / a_area
-            is_divergence = ratio < 0.7 and b_near_zero
+            is_divergence = ratio < DIVERGENCE_RATIO and b_near_zero
             if c_area < 1:
                 continue
             if is_divergence:
@@ -342,10 +356,10 @@ def find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, close
 
     # --- 成交量辅助 ---
     volumes = [d['volume'] for d in daily_data] if daily_data else []
-    vol_ma10 = sum(volumes[-10:]) / 10 if len(volumes) >= 10 else 0
+    vol_ma10 = sum(volumes[-VOL_MA_WINDOW:]) / VOL_MA_WINDOW if len(volumes) >= VOL_MA_WINDOW else 0
     vol_now = volumes[-1] if volumes else 0
     vol_ratio = vol_now / vol_ma10 if vol_ma10 > 0 else 1.0
-    vol_breakout = vol_ratio > 1.5  # 放量突破
+    vol_breakout = vol_ratio > VOL_RATIO_BREAKOUT  # 放量突破
 
     # ================================================================
     # 第一类买点：下跌趋势背驰（第29/37课）
@@ -391,22 +405,18 @@ def find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, close
         pullback_confirmed = False
         if points:
             first_buy = next((bp for bp in points if bp['type'] == '第一类买点'), None)
-            if first_buy:
-                buy_idx = None
-                for idx in range(len(closes) - 1, -1, -1):
-                    if abs(closes[idx] - first_buy['price']) / first_buy['price'] < 0.01:
-                        buy_idx = idx
-                        break
-                if buy_idx is not None:
-                    high_after_buy = max(closes[buy_idx:])
-                    low_after_buy = min(closes[buy_idx:])
-                    # 从高点回调至少5%，且回落点在前低1.05倍以内
-                    if high_after_buy > 0:
-                        pullback_pct = (high_after_buy - low_after_buy) / high_after_buy
-                        if pullback_pct >= 0.05 and low_after_buy <= last_bot['price'] * 1.05:
-                            pullback_confirmed = True
+            if first_buy and len(closes) >= 10:
+                # 一买在当前bar，往前看10根K线找回调区间
+                lookback = min(10, len(closes))
+                recent = closes[-lookback:]
+                high_recent = max(recent)
+                low_recent = min(recent)
+                if high_recent > 0:
+                    pullback_pct = (high_recent - low_recent) / high_recent
+                    if pullback_pct >= PULLBACK_MIN_PCT and low_recent <= last_bot['price'] * PULLBACK_TOLERANCE:
+                        pullback_confirmed = True
         if (pullback_confirmed and
-            current_price > last_bot['price'] * 1.02 and
+            current_price > last_bot['price'] * PRICE_FILTER and
             current_diff > current_dea):
             points.append({
                 'type': '第二类买点', 'direction': 'buy',
@@ -500,7 +510,7 @@ def full_analysis(daily_data, name, code):
     strokes = build_strokes(fractals, merged)
     segments = build_segments(strokes)
     pivots = find_pivots(segments)
-    diff, dea, macd_hist = calc_macd(closes)
+    diff, dea, macd_hist = calc_macd(closes, MACD_MA_SHORT, MACD_MA_LONG, MACD_SIGNAL)
     trend_structures = find_trend_structure(pivots, segments, diff, dea, macd_hist, closes, daily_data)
     buy_sell_points = find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, closes,
                                            trend_structures, daily_data)

@@ -45,7 +45,7 @@ except Exception:
 # ============================================================
 
 # --- 从 stock_config.json 统一加载配置 ---
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'stock_config.json')
 def _load_config():
     try:
         with open(_CONFIG_PATH, 'r', encoding='utf-8') as f:

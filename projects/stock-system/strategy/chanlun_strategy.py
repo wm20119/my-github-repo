@@ -16,7 +16,8 @@
   backtest_single     - 单票回测
 """
 import sys, os
-sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chanlun_engine as ce
 
 # ============================================================
@@ -253,7 +254,9 @@ def evaluate_chanlun_quality(klines, name, code):
                 klines, pos['entry_price'], pos['hold_days'], name, code, bar_index=i, _pc=pc)
             if should_exit:
                 if reason == '止损':
-                    pnl = STOP_LOSS  # 止损价: entry_price*(1+STOP_LOSS)
+                    # 用实际最低价计算真实止损PnL（不再固定-5%）
+                    low_p = klines[i].get('low', klines[i]['close'])
+                    pnl = (low_p - pos['entry_price']) / pos['entry_price']
                 else:
                     p = klines[i]['close']
                     pnl = (p - pos['entry_price']) / pos['entry_price']
@@ -395,7 +398,9 @@ def backtest_single(klines, name, code, score_info=None):
                 klines, pos['entry_price'], pos['hold_days'], name, code, bar_index=i, _pc=pc)
             if should_exit:
                 if reason == '止损':
-                    pnl = STOP_LOSS  # 止损价: entry_price*(1+STOP_LOSS)
+                    # 用实际最低价计算真实止损PnL（不再固定-5%）
+                    low_p = klines[i].get('low', klines[i]['close'])
+                    pnl = (low_p - pos['entry_price']) / pos['entry_price']
                 else:
                     p = klines[i]['close']
                     pnl = (p - pos['entry_price']) / pos['entry_price']

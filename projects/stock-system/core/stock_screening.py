@@ -4,9 +4,12 @@
 缠论历史胜率先筛(A/B级+三买信号) → stock-scorer评分把关
 输出：两道关都过的候选票
 """
-import sys, os, json, time, tempfile
-sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
-from kline_db import init_db, get_latest_date, upsert_klines, get_klines
+import sys, os, json, tempfile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'strategy'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'execution'))
+from kline_db import init_db, get_klines
 from chanlun_strategy import (
     WINDOW, evaluate_chanlun_quality, scan_recent_signals,
 )
@@ -27,7 +30,7 @@ def atomic_json_dump(data, path):
         raise
 
 # 股票池：从stock_config.json统一读取
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'stock_config.json')
 
 def load_pool_codes():
     """从stock_config.json读取股票池代码"""
@@ -129,9 +132,7 @@ def run_screening():
                     scores[r['code']] = r
         except Exception as e:
             report.append(f"  批次错误: {e}")
-        
-        time.sleep(0.5)
-    
+
     report.append(f"  评分完成: {len(scores)}只通过(≥50分)")
     
     # 4. 合并结果
@@ -154,8 +155,8 @@ def run_screening():
     def _rank_key(x):
         wr = x[1]['chanlun']['win_rate']
         pf = x[1]['chanlun']['profit_factor']
-        if pf >= 999:  # evaluate_chanlun_quality将inf转为999.99
-            pf = 5
+        if pf >= 999.9:  # evaluate_chanlun_quality将inf转为999.99，避免误截正常值
+            pf = 5.0
         score = x[1]['score']['total']
         return -(wr * pf * 0.6 + score * 0.4)
     sorted_results = sorted(chanlun_results.items(), key=_rank_key)
