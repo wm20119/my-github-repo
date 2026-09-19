@@ -37,12 +37,31 @@ from sim_portfolio import (
     load_nav, save_nav,
     INITIAL_CAPITAL, MAX_POSITIONS,
 )
-import sim_portfolio as _sp
 
-# ========== Tushare 批量拉取当天K线（复用sim_portfolio的初始化）==========
+# ========== Tushare 初始化 ==========
+_TUSHARE_PRO = None
+def _init_tushare():
+    global _TUSHARE_PRO
+    if _TUSHARE_PRO is not None:
+        return
+    try:
+        import tushare as ts
+        token_path = os.path.expanduser('~/.tushare/token.txt')
+        if os.path.exists(token_path):
+            with open(token_path) as f:
+                token = f.read().strip()
+            if token:
+                _TUSHARE_PRO = ts.pro_api(token)
+    except Exception:
+        pass
+
 def _tushare_code(code):
     """股票代码 → ts_code"""
-    return _sp._tushare_code(code)
+    if code.startswith('8'):
+        return f'{code}.BJ'
+    if code.startswith(('6', '9')):
+        return f'{code}.SH'
+    return f'{code}.SZ'
 
 def _fetch_realtime_tencent(codes):
     """从腾讯行情API获取实时价格（盘中优先用这个）"""
@@ -96,13 +115,13 @@ def fetch_today_klines(codes):
             return {c: d for c, d in result.items() if d['date'] == today}
 
     # 收盘后或腾讯失败，用Tushare
-    _sp._init_tushare()
-    if _sp._TUSHARE_PRO is None:
+    _init_tushare()
+    if _TUSHARE_PRO is None:
         return {}
     ts_codes = [_tushare_code(c) for c in codes]
     result = {}
     try:
-        df = _sp._TUSHARE_PRO.daily(ts_code=','.join(ts_codes),
+        df = _TUSHARE_PRO.daily(ts_code=','.join(ts_codes),
                                 start_date=today, end_date=today,
                                 fields='ts_code,trade_date,open,high,low,close,vol')
         if df is not None and len(df) > 0:
@@ -142,11 +161,17 @@ def load_screening_results():
     try:
         with open(cache_file) as f:
             data = json.load(f)
+        # 结构校验
+        if not isinstance(data, dict) or 'passed' not in data:
+            log.error(f"screening_latest.json结构异常: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            return []
+        # 时间校验：超过1天的数据不用
         data_date = data.get('date', '')
         if data_date:
             try:
                 data_dt = datetime.strptime(data_date, '%Y%m%d')
                 if (datetime.now() - data_dt).days > 1:
+                    log.info(f"screening数据过期: {data_date}")
                     return []
             except ValueError:
                 pass
