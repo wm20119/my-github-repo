@@ -32,11 +32,15 @@ def process_inclusion(klines):
             if direction == 'up':
                 new_high = max(prev['high'], curr['high'])
                 new_low = max(prev['low'], curr['low'])
+                new_open = min(prev['open'], curr['open'])
+                new_close = max(prev['close'], curr['close'])
             else:
                 new_high = min(prev['high'], curr['high'])
                 new_low = min(prev['low'], curr['low'])
-            merged[-1] = {'date': curr['date'], 'open': prev['open'], 'high': new_high,
-                          'low': new_low, 'close': curr['close'], 'volume': prev['volume'] + curr['volume']}
+                new_open = max(prev['open'], curr['open'])
+                new_close = min(prev['close'], curr['close'])
+            merged[-1] = {'date': curr['date'], 'open': new_open, 'high': new_high,
+                          'low': new_low, 'close': new_close, 'volume': prev['volume'] + curr['volume']}
         else:
             merged.append(curr.copy())
     return merged
@@ -412,30 +416,36 @@ def find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, close
             })
 
     # ================================================================
-    # 第三类买点：中枢突破+回踩（第37/65课）
-    # 前提：近20天曾有价格在中枢内 → 突破ZG → 回踩不破ZG
+    # 第三类买点：中枢突破（第37/65课）
+    # 条件：前一天收盘在中枢内 + 当天收盘突破ZG + 当天最低不破ZG
     # ================================================================
-    if len(pivots) >= 1 and len(closes) >= 10:
-        pivot_in_range = any(last_pivot['zd'] <= c <= last_pivot['zg'] for c in closes[-20:])
-        if pivot_in_range and current_price > last_pivot['zg']:
-            recent_lows = min(closes[-5:])
-            if recent_lows >= last_pivot['zg']:
-                # v3.3: 放量突破=strong，缩量突破=medium（仍有效但权重低）
-                if vol_breakout:
-                    points.append({
-                        'type': '第三类买点', 'direction': 'buy',
-                        'price': current_price,
-                        'signal': f'放量突破中枢[{last_pivot["zd"]:.1f},{last_pivot["zg"]:.1f}]后回踩不破ZG',
-                        'strength': 'strong',
-                    })
-                elif len(closes) >= 10:
-                    # 缩量突破也给信号，但降级为medium
-                    points.append({
-                        'type': '第三类买点', 'direction': 'buy',
-                        'price': current_price,
-                        'signal': f'突破中枢[{last_pivot["zd"]:.1f},{last_pivot["zg"]:.1f}]后回踩不破ZG(缩量)',
-                        'strength': 'medium',
-                    })
+    if len(pivots) >= 1 and len(closes) >= 2 and len(daily_data) >= 2:
+        zg_val = last_pivot['zg']
+        prev_close = closes[-2]
+        cur_low = daily_data[-1]['low']
+        # 前一天收盘在中枢内（≤ZG）
+        if prev_close <= zg_val:
+            # 当天收盘突破ZG
+            if current_price > zg_val:
+                # 当天最低不破ZG
+                if cur_low >= zg_val:
+                    breakout_date = daily_data[-1]['date']
+                    if vol_breakout:
+                        points.append({
+                            'type': '第三类买点', 'direction': 'buy',
+                            'price': current_price,
+                            'date': breakout_date,
+                            'signal': f'放量突破中枢[{last_pivot["zd"]:.1f},{last_pivot["zg"]:.1f}]',
+                            'strength': 'strong',
+                        })
+                    else:
+                        points.append({
+                            'type': '第三类买点', 'direction': 'buy',
+                            'price': current_price,
+                            'date': breakout_date,
+                            'signal': f'突破中枢[{last_pivot["zd"]:.1f},{last_pivot["zg"]:.1f}]',
+                            'strength': 'medium',
+                        })
 
     # ================================================================
     # 第一类卖点：上涨趋势背驰（第29/37课）
@@ -467,6 +477,7 @@ def find_buy_sell_points(pivots, segments, fractals, diff, dea, macd_hist, close
                 points.append({
                     'type': '第三类卖点', 'direction': 'sell',
                     'price': current_price,
+                    'date': daily_data[-1]['date'],  # 新增：三卖信号添加date字段
                     'signal': f'跌破中枢[{last_pivot["zd"]:.1f},{last_pivot["zg"]:.1f}]后回抽不破ZD',
                     'strength': 'strong',
                 })
@@ -542,11 +553,16 @@ def full_analysis(daily_data, name, code):
         else: signals.append(f"📌 价格在中枢[{last_p['zd']:.2f},{last_p['zg']:.2f}]内")
 
     # v3.1: 趋势背驰信号（来自trend_structures，已经过严格验证）
+    # 封顶：多个趋势结构的评分贡献最多±2分，防止过权
+    trend_score = 0
     for ts in trend_structures:
         if ts['trend'] == 'down':
-            signals.append(f"⚡ 下跌趋势背驰(A/C比{ts['ratio']:.2f})→底部信号"); score += 2
+            signals.append(f"⚡ 下跌趋势背驰(A/C比{ts['ratio']:.2f})→底部信号")
+            trend_score += 2
         else:
-            signals.append(f"⚡ 上涨趋势背驰(A/C比{ts['ratio']:.2f})→顶部信号"); score -= 2
+            signals.append(f"⚡ 上涨趋势背驰(A/C比{ts['ratio']:.2f})→顶部信号")
+            trend_score -= 2
+    score += max(-2, min(2, trend_score))
 
     for bp in buy_sell_points:
         if bp['direction'] == 'buy':

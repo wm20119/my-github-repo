@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+统一任务脚本 — 模拟盘操作 + 股票池信号扫描
+所有盘中任务（09:30/11:30/14:50/15:30）统一入口
+
+模式：
+  --morning   09:30 早盘买入 + 股票池扫描
+  --midday    14:50 盘中检查（出场+买入）+ 股票池扫描
+  --summary   15:30 日报总结（只读）
+"""
+import sys, os, json, time, argparse
+from datetime import datetime
+sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
+
+from kline_db import get_klines
+from chanlun_strategy import (
+    WINDOW, evaluate_chanlun_quality, scan_recent_signals,
+)
+from stock_screening import POOL_CODES
+from sim_portfolio import (
+    do_exits, do_buys,
+    load_portfolio, save_portfolio, load_backup_pool,
+    load_nav, save_nav,
+    INITIAL_CAPITAL, MAX_POSITIONS,
+)
+import sim_portfolio as _sp
+
+# ========== Tushare 批量拉取当天K线（复用sim_portfolio的初始化）==========
+def _tushare_code(code):
+    """股票代码 → ts_code"""
+    return _sp._tushare_code(code)
+
+def _fetch_realtime_tencent(codes):
+    """从腾讯行情API获取实时价格（盘中优先用这个）"""
+    import urllib.request
+    symbols = []
+    for c in codes:
+        if c.startswith('6') or c.startswith('9'):
+            symbols.append(f'sh{c}')
+        elif c.startswith('8'):
+            symbols.append(f'bj{c}')
+        else:
+            symbols.append(f'sz{c}')
+    url = f'http://qt.gtimg.cn/q={",".join(symbols)}'
+    try:
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = resp.read().decode('gbk')
+    except Exception:
+        return {}
+    result = {}
+    for line in data.strip().split(';'):
+        line = line.strip()
+        if not line or '=' not in line:
+            continue
+        parts = line.split('"')[1].split('~')
+        if len(parts) < 50:
+            continue
+        code = parts[2]
+        result[code] = {
+            'date': parts[30][:8],
+            'open': float(parts[5]),
+            'high': float(parts[33]),
+            'low': float(parts[34]),
+            'close': float(parts[3]),
+            'volume': float(parts[6]),
+        }
+    return result
+
+def fetch_today_klines(codes):
+    """获取今天K线：盘中用腾讯实时API，收盘后用Tushare"""
+    if not codes:
+        return {}
+    today = datetime.now().strftime('%Y%m%d')
+    now_hour = datetime.now().hour
+
+    # 盘中（9:30-15:00）优先用腾讯实时
+    if 9 <= now_hour < 16:
+        result = _fetch_realtime_tencent(codes)
+        if result:
+            # 只返回今天日期的数据
+            return {c: d for c, d in result.items() if d['date'] == today}
+
+    # 收盘后或腾讯失败，用Tushare
+    _sp._init_tushare()
+    if _sp._TUSHARE_PRO is None:
+        return {}
+    ts_codes = [_tushare_code(c) for c in codes]
+    result = {}
+    try:
+        df = _TUSHARE_PRO.daily(ts_code=','.join(ts_codes),
+                                start_date=today, end_date=today,
+                                fields='ts_code,trade_date,open,high,low,close,vol')
+        if df is not None and len(df) > 0:
+            for ts_c, code in zip(ts_codes, codes):
+                row = df[df['ts_code'] == ts_c]
+                if len(row) > 0:
+                    r = row.iloc[0]
+                    result[code] = {
+                        'date': str(r['trade_date']),
+                        'open': float(r['open']),
+                        'high': float(r['high']),
+                        'low': float(r['low']),
+                        'close': float(r['close']),
+                        'volume': float(r['vol']),
+                    }
+    except Exception as e:
+        print(f"  ⚠️ Tushare批量拉取失败: {e}", file=sys.stderr)
+    return result
+
+# ========== 股票池 ==========
+import json as _json
+_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_config.json')
+try:
+    with open(_cfg_path) as _f:
+        _cfg = _json.load(_f)
+    _STOCK_NAMES = {'600030': '中信证券', '688019': '安集科技', '688008': '澜起科技',
+                    '600584': '长电科技', '300750': '宁德时代', '000977': '浪潮信息', '002156': '通富微电'}
+    POOL = [(c, _STOCK_NAMES.get(c, c)) for c in _cfg.get('stocks', [])]
+except Exception:
+    POOL = [(c, c) for c in POOL_CODES]
+
+def load_screening_results():
+    """加载最近一次选股扫描的结果"""
+    cache_file = os.path.expanduser('~/.hermes/cache/screening_latest.json')
+    if not os.path.exists(cache_file):
+        return []
+    try:
+        with open(cache_file) as f:
+            data = json.load(f)
+        data_date = data.get('date', '')
+        if data_date:
+            try:
+                data_dt = datetime.strptime(data_date, '%Y%m%d')
+                if (datetime.now() - data_dt).days > 1:
+                    return []
+            except ValueError:
+                pass
+        return [(c, info['score']['name']) for c, info in data.get('passed', {}).items()]
+    except Exception:
+        return []
+
+# ========== 股票池信号扫描 ==========
+def scan_one(code, name, today_klines=None):
+    """扫描单只票，返回结果字典"""
+    try:
+        kl = get_klines(code)
+        if not kl or len(kl) < WINDOW + 100:
+            return None
+        today_str = datetime.now().strftime('%Y%m%d')
+        if kl[-1]['date'] != today_str:
+            if today_klines and code in today_klines:
+                kl.append(today_klines[code])
+        stats = evaluate_chanlun_quality(kl, name, code)
+        quality = stats['quality'] if stats else '?'
+        wr = stats['win_rate'] if stats else 0
+        pf = stats['profit_factor'] if stats else 0
+        trades = stats['total_trades'] if stats else 0
+        # 三买信号：只看最后1根K线（与选股系统一致）
+        today_signal = scan_recent_signals(kl, name, code, lookback=1)
+        latest = kl[-1]
+        closes = [d['close'] for d in kl]
+        ma20_now = sum(closes[-20:]) / 20 if len(closes) >= 20 else closes[-1]
+        above_now = (latest['close'] - ma20_now) / ma20_now * 100 if ma20_now > 0 else 0
+        return {
+            'code': code, 'name': name,
+            'price': latest['close'], 'above_ma20': above_now,
+            'quality': quality, 'win_rate': wr, 'profit_factor': pf,
+            'total_trades': trades,
+            'has_signal': bool(today_signal),
+            'signal': today_signal[-1] if today_signal else None,
+        }
+    except Exception as e:
+        print(f"  ⚠️ {name}({code}) 扫描失败: {e}", file=sys.stderr)
+        return None
+
+# ========== 模拟盘操作报告 ==========
+def format_portfolio_ops(bought, sold, stuck, skipped):
+    """格式化模拟盘操作结果"""
+    lines = []
+    if bought:
+        lines.append(f"\n📥 买入 {len(bought)}只:")
+        for b in bought:
+            lines.append(f"  {b['name']}({b['code']}) ¥{b['entry_price']:.2f} {b['shares']}股 ZG={b.get('pivot_zg', '?')}")
+    if sold:
+        lines.append(f"\n📤 卖出 {len(sold)}只:")
+        for s in sold:
+            lines.append(f"  {s['name']}({s['code']}) {s['entry_date']}→{s['exit_date']} "
+                         f"买{s['entry_price']:.2f}→卖{s['exit_price']:.2f} {s['pnl_pct']:+.1f}% [{s['exit_reason']}]")
+    if stuck:
+        lines.append(f"\n🔒 一字跌停无法卖出 {len(stuck)}只（继续持有）:")
+        for s in stuck:
+            pnl = (s['current_price'] - s['entry_price']) / s['entry_price'] * 100
+            lines.append(f"  {s['name']}({s['code']}) 买{s['entry_price']:.2f}→现{s['current_price']:.2f} "
+                         f"{pnl:+.1f}% 触发{s['reason']} 持{s['hold_days']}天")
+    if skipped:
+        lines.append(f"\n🚫 一字涨停无法买入 {len(skipped)}只:")
+        for s in skipped:
+            lines.append(f"  {s['name']}({s['code']}) ¥{s['price']:.2f} ZG={s['zg']:.1f} [{s['chanlun_quality']}级]")
+    return lines
+
+def format_pool_scan(results, pool_codes):
+    """格式化股票池扫描结果"""
+    lines = []
+    has_signal = [r for r in results if r['has_signal']]
+    pool_results = [r for r in results if r['code'] in pool_codes]
+    screen_results = [r for r in results if r['code'] not in pool_codes]
+
+    lines.append(f"\n{'=' * 50}")
+    lines.append(f"📌 股票池 ({len(pool_results)}只)")
+    lines.append("=" * 50)
+    for r in pool_results:
+        pf_str = 'N/A' if r['profit_factor'] == 0 else ('∞' if r['profit_factor'] >= 999.99 else f"{r['profit_factor']:.2f}")
+        line = f"\n{r['name']}({r['code']}) {r['price']:.2f} 离MA20{r['above_ma20']:+.1f}%"
+        line += f"\n  质量: {r['quality']}级 胜率{r['win_rate']:.0f}%({r['total_trades']}笔) 盈亏比{pf_str}"
+        if r['has_signal']:
+            sig = r['signal']
+            line += f"\n  🔔 三买: {sig['date']} ¥{sig['price']:.2f} RSI={sig['rsi']:.0f} 量比={sig['vol_ratio']:.2f}"
+        else:
+            line += "\n  无三买信号"
+        lines.append(line)
+
+    if screen_results:
+        lines.append(f"\n{'=' * 50}")
+        lines.append(f"🎯 选股候选 ({len(screen_results)}只)")
+        lines.append("=" * 50)
+        for r in sorted(screen_results, key=lambda x: -x['win_rate']):
+            pf_str = 'N/A' if r['profit_factor'] == 0 else ('∞' if r['profit_factor'] >= 999.99 else f"{r['profit_factor']:.2f}")
+            line = f"\n{r['name']}({r['code']}) {r['price']:.2f} 离MA20{r['above_ma20']:+.1f}%"
+            line += f"\n  质量: {r['quality']}级 胜率{r['win_rate']:.0f}%({r['total_trades']}笔) 盈亏比{pf_str}"
+            if r['has_signal']:
+                sig = r['signal']
+                line += f"\n  🔔 三买: {sig['date']} ¥{sig['price']:.2f} RSI={sig['rsi']:.0f} 量比={sig['vol_ratio']:.2f}"
+            else:
+                line += "\n  无三买信号"
+            lines.append(line)
+
+    if has_signal:
+        lines.append(f"\n{'=' * 50}")
+        lines.append(f"🔔 有三买信号的票: {len(has_signal)}只")
+        lines.append("=" * 50)
+        for r in has_signal:
+            sig = r['signal']
+            lines.append(f"  {r['name']}({r['code']}) ¥{sig['price']:.2f} RSI={sig['rsi']:.0f} 量比={sig['vol_ratio']:.2f}")
+    else:
+        lines.append("\n当前无三买信号触发。")
+
+    return lines
+
+def format_account(pf, nav_history):
+    """格式化账户状态"""
+    lines = []
+    total_mv = sum(p['market_value'] for p in pf['positions'])
+    nav = pf['cash'] + total_mv
+    nav_pct = (nav - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+
+    lines.append(f"\n💰 账户:")
+    lines.append(f"  总资产: ¥{nav:,.0f} ({nav_pct:+.1f}%)")
+    lines.append(f"  现金: ¥{pf['cash']:,.0f}")
+    lines.append(f"  持仓市值: ¥{total_mv:,.0f}")
+    lines.append(f"  持仓数: {len(pf['positions'])}/{MAX_POSITIONS}")
+
+    if pf['positions']:
+        lines.append(f"\n📋 持仓明细:")
+        for p in pf['positions']:
+            lines.append(f"  {p['name']}({p['code']}) {p['shares']}股 "
+                         f"买{p['entry_price']:.2f}→现{p['current_price']:.2f} "
+                         f"{p['pnl_pct']:+.1f}% 持{p['hold_days']}天")
+
+    if pf['trades']:
+        wins = [t for t in pf['trades'] if t['pnl_pct'] > 0]
+        lines.append(f"\n📈 历史统计:")
+        lines.append(f"  总交易: {len(pf['trades'])}笔")
+        lines.append(f"  胜率: {len(wins)}/{len(pf['trades'])} = {len(wins) / len(pf['trades']) * 100:.0f}%")
+
+    if len(nav_history) > 1:
+        lines.append(f"\n📉 净值趋势（近10天）:")
+        for n in nav_history[-10:]:
+            lines.append(f"  {n['date']} {n['nav_pct']:+.1f}%")
+
+    return lines
+
+# ========== 核心：拉K线 + 操作 + 扫描 ==========
+def run_core(do_portfolio_ops=True):
+    """
+    统一核心逻辑：
+    1. 拉当天K线（股票池+持仓+备选池）
+    2. 模拟盘操作（可选）
+    3. 股票池扫描
+    4. 输出报告
+    """
+    now = datetime.now()
+    today = now.strftime('%Y%m%d')
+    report = []
+
+    # 收集所有代码
+    all_stocks = [(c, n) for c, n in POOL]
+    screening = load_screening_results()
+    pool_codes = [c for c, _ in POOL]
+    for c, n in screening:
+        if c not in pool_codes:
+            all_stocks.append((c, n))
+
+    pf = load_portfolio()
+    pool = load_backup_pool()
+    nav_history = load_nav()
+
+    all_codes = list(set(
+        [c for c, _ in all_stocks]
+        + [p['code'] for p in pf['positions']]
+        + [s['code'] for s in pool]
+    ))
+    today_klines = fetch_today_klines(all_codes) if all_codes else {}
+    if today_klines:
+        report.append(f"  Tushare补充{len(today_klines)}只当天K线")
+
+    # 模拟盘操作
+    bought, sold, stuck, skipped = [], [], [], []
+    if do_portfolio_ops and (pf['positions'] or pool):
+        if pf['positions']:
+            sold, remaining, stuck = do_exits(pf, today, now, report, today_klines=today_klines)
+            pf['positions'] = remaining
+        if pool:
+            bought, skipped = do_buys(pf, pool, today, now, report, today_klines=today_klines)
+        save_portfolio(pf)
+
+    # 模拟盘操作报告
+    report.extend(format_portfolio_ops(bought, sold, stuck, skipped))
+
+    # 股票池扫描
+    results = []
+    for i, (code, name) in enumerate(all_stocks):
+        if i % 5 == 0:
+            report.append(f"\n  扫描进度: {i + 1}/{len(all_stocks)}")
+        r = scan_one(code, name, today_klines)
+        if r:
+            results.append(r)
+
+    report.extend(format_pool_scan(results, pool_codes))
+
+    # 账户状态
+    report.extend(format_account(pf, nav_history))
+
+    # 更新净值（每次都保存，不只是有交易时）
+    total_mv = sum(p['market_value'] for p in pf['positions'])
+    nav = pf['cash'] + total_mv
+    nav_pct = (nav - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+    nav_entry = {'date': today, 'nav': round(nav, 2), 'nav_pct': round(nav_pct, 2)}
+    if nav_history and nav_history[-1]['date'] == today:
+        nav_history[-1] = nav_entry
+    else:
+        nav_history.append(nav_entry)
+    nav_history = nav_history[-120:]
+    save_nav(nav_history)
+
+    return "\n".join(report)
+
+# ========== 三个模式 ==========
+def run_morning():
+    """09:30 早盘买入 + 股票池扫描"""
+    now = datetime.now()
+    report = [f"📊 模拟盘·早盘 {now.strftime('%Y%m%d %H:%M')}",
+              f"规则: 三买8层过滤入场 | 100万×10只×10%",
+              "=" * 50]
+    report.extend(run_core(do_portfolio_ops=True).split("\n"))
+    return "\n".join(report)
+
+def run_midday():
+    """14:50 盘中检查 + 股票池扫描"""
+    now = datetime.now()
+    report = [f"📊 模拟盘·盘中 {now.strftime('%Y%m%d %H:%M')}",
+              f"规则: 止盈+20%/止损-5%/超时60天 | 100万×10只×10%",
+              "=" * 50]
+    report.extend(run_core(do_portfolio_ops=True).split("\n"))
+    return "\n".join(report)
+
+def run_summary():
+    """15:30 日报总结（只读）"""
+    now = datetime.now()
+    pf = load_portfolio()
+    nav_history = load_nav()
+    report = [f"📊 模拟盘·日报 {now.strftime('%Y%m%d %H:%M')}",
+              "=" * 50]
+    report.extend(format_account(pf, nav_history))
+    return "\n".join(report)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='统一任务：模拟盘+股票池')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--morning', action='store_true', help='09:30 早盘买入+扫描')
+    group.add_argument('--midday', action='store_true', help='14:50 盘中检查+扫描')
+    group.add_argument('--summary', action='store_true', help='15:30 日报总结（只读）')
+    args = parser.parse_args()
+
+    if args.morning:
+        print(run_morning())
+    elif args.midday:
+        print(run_midday())
+    elif args.summary:
+        print(run_summary())
+    else:
+        print(run_morning())

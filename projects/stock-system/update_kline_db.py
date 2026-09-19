@@ -82,7 +82,7 @@ def fetch_from_tushare(code, start_date=None, end_date=None, retries=3):
             data = []
             for item in items:
                 trade_date = item[0]
-                date_str = f'{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}'
+                date_str = str(trade_date)
                 data.append({
                     'date': date_str,
                     'open': float(item[1]),
@@ -106,12 +106,8 @@ def update_stock(code):
     latest = get_latest_date(code)
     
     if latest:
-        # 兼容两种日期格式：2026-09-17 或 20260917
         try:
-            if '-' in latest:
-                start_date = (datetime.strptime(latest, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y%m%d')
-            else:
-                start_date = (datetime.strptime(latest, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
+            start_date = (datetime.strptime(latest, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
         except ValueError:
             start_date = '20100101'
     else:

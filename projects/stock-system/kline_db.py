@@ -98,12 +98,10 @@ def upsert_klines(code, klines_data):
     """
     conn = get_conn()
     try:
-        # 统一日期格式为 YYYY-MM-DD
+        # 统一日期格式为 YYYYMMDD（与Tushare一致）
         normalized = []
         for d in klines_data:
-            date = d['date']
-            if '-' not in date and len(date) == 8:
-                date = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
+            date = d['date'].replace('-', '')
             normalized.append((code, date, d['open'], d['high'], d['low'], d['close'], d['volume']))
         
         conn.executemany(

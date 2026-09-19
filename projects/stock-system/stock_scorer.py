@@ -578,7 +578,7 @@ def get_kline_sina(code, days=120):
         result = []
         for item in data:
             result.append({
-                'date': item.get('day', ''),
+                'date': item.get('day', '').replace('-', ''),
                 'open': float(item.get('open', 0)),
                 'high': float(item.get('high', 0)),
                 'low': float(item.get('low', 0)),
@@ -1993,7 +1993,7 @@ def analyze(codes, skip_industry=False, chokepoint_overrides=None, skip_trends=F
 
 def print_results(results):
     """格式化输出结果"""
-    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    now = datetime.now().strftime('%Y%m%d %H:%M')
     print()
     print('=' * 90)
     print('  Serenity产业链卡点投资评分系统 v12 · 满分100')

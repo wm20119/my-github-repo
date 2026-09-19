@@ -108,7 +108,7 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
     p = klines[i]['close']
 
     # ===== 快速前置过滤（不调full_analysis）=====
-    # 条件3: MACD diff > 0
+    # 条件3: MACD柱状图>0（即DIF>DEA，金叉状态）
     if macd_all[i] <= 0:
         return False, None
     # 条件4: 价格 >= MA20
@@ -125,7 +125,7 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
         return False, None
 
     # ===== 慢条件（需full_analysis）=====
-    window = klines[i - WINDOW:i]
+    window = klines[i - WINDOW:i+1]
     if len(window) < 30:
         return False, None
 
@@ -136,10 +136,12 @@ def check_entry_signal(klines, name, code, bar_index=None, _pc=None):
     if not r:
         return False, None
 
-    bs = [bp['type'] for bp in r['buy_sell_points'] if bp['direction'] == 'buy']
+    bs = [bp for bp in r['buy_sell_points'] if bp['direction'] == 'buy']
 
     # 条件1: 第三类买点
-    if '第三类买点' not in bs:
+    today_date = dates[i]
+    today_bs = [bp for bp in bs if bp['type'] == '第三类买点' and bp.get('date') == today_date]
+    if not today_bs:
         return False, None
     # 条件2: score > 0
     if r['score'] <= 0:
@@ -189,12 +191,14 @@ def check_exit_signal(klines, entry_price, hold_days, name, code, bar_index=None
         return True, '超时'
 
     # 卖出信号 + 破位
-    window = klines[i - WINDOW:i]
+    window = klines[i - WINDOW:i+1]
     if len(window) >= 30:
         try:
             r = ce.full_analysis(window, name, code)
             if r:
-                ss = [bp['type'] for bp in r['buy_sell_points'] if bp['direction'] == 'sell']
+                today_date = klines[i]['date']
+                ss = [bp['type'] for bp in r['buy_sell_points']
+                      if bp['direction'] == 'sell' and bp.get('date') == today_date]
                 for s in r['signals']:
                     if '上涨趋势背驰' in s:
                         ss.append('上涨背驰')
@@ -230,7 +234,7 @@ def evaluate_chanlun_quality(klines, name, code):
     trades = []; pos = None; cd = None
     for i in range(WINDOW, len(klines)):
         td = dates[i]
-        window = klines[i - WINDOW:i]
+        window = klines[i - WINDOW:i+1]
         if len(window) < 30:
             continue
 
@@ -276,15 +280,16 @@ def evaluate_chanlun_quality(klines, name, code):
     al = sum(t['pnl'] for t in losses) / max(1, len(losses))
     pf = abs(aw / al) if al != 0 else float('inf')
 
+    # 评级标准（放宽版：A≥65%+PF≥1.5 / B≥50%+PF≥1.0）
     if len(losses) == 0 and len(wins) >= 2:
-        quality = 'A'
+        quality = 'A'  # 无亏损特殊处理
     elif len(wins) == 0 and len(losses) >= 2:
         quality = 'D'
-    elif wr >= 80 and pf >= 2.0:
+    elif wr >= 65 and pf >= 1.5:
         quality = 'A'
-    elif wr >= 60 and pf >= 1.5:
+    elif wr >= 50 and pf >= 1.0:
         quality = 'B'
-    elif wr >= 50:
+    elif wr >= 40:
         quality = 'C'
     else:
         quality = 'D'
@@ -331,7 +336,7 @@ def scan_recent_signals(klines, name, code, lookback=30):
         if p < max(cl):
             continue
         # 慢条件：per-bar full_analysis
-        window = klines[i - WINDOW:i]
+        window = klines[i - WINDOW:i+1]
         if len(window) < 30:
             continue
         try:
@@ -343,6 +348,11 @@ def scan_recent_signals(klines, name, code, lookback=30):
         bs = [bp for bp in r['buy_sell_points']
               if bp['type'] == '第三类买点' and bp['direction'] == 'buy']
         if not bs:
+            continue
+        # 只选当天产生的三买信号
+        today_date = dates[i]
+        today_bs = [bp for bp in bs if bp.get('date') == today_date]
+        if not today_bs:
             continue
         zg = r['pivots'][-1]['zg']
         if p <= zg:

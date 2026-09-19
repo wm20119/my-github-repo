@@ -45,7 +45,7 @@ def run_screening():
     import sys
     now = datetime.now()
     report = []
-    report.append(f"📊 全A股选股扫描 {now.strftime('%Y-%m-%d %H:%M')}")
+    report.append(f"📊 全A股选股扫描 {now.strftime('%Y%m%d %H:%M')}")
     report.append("流程: 全A股 → 缠论快筛(A/B级+三买信号) → stock-scorer评分(≥50分)")
     report.append("=" * 50)
 
@@ -88,7 +88,8 @@ def run_screening():
                     chanlun_candidates[code] = {
                         'name': name,
                         'chanlun': stats,
-                        'kl': kl,
+                        'latest': kl[-1],
+                        'ma20': sum(d['close'] for d in kl[-20:]) / min(20, len(kl)),
                     }
         except Exception as e:
             chanlun_errors += 1
@@ -141,7 +142,8 @@ def run_screening():
                 'score': scores[code],
                 'chanlun': chanlun_candidates[code]['chanlun'],
                 'has_signal': True,
-                'kl': chanlun_candidates[code]['kl'],
+                'latest': chanlun_candidates[code]['latest'],
+                'ma20': chanlun_candidates[code]['ma20'],
             }
 
     # 4. 输出结果
@@ -165,10 +167,8 @@ def run_screening():
     for code, info in sorted_results:
         s = info['score']
         c = info['chanlun']
-        kl = info['kl']
-        latest = kl[-1]
-        closes = [d['close'] for d in kl]
-        ma20_now = sum(closes[-20:]) / 20
+        latest = info['latest']
+        ma20_now = info['ma20']
         above = (latest['close'] - ma20_now) / ma20_now * 100 if ma20_now > 0 else 0
 
         pf_str = '∞' if c['profit_factor'] >= 999 else f"{c['profit_factor']:.2f}"
@@ -184,7 +184,7 @@ def run_screening():
     # 保存结果供盘中扫描使用（即使为空也要更新，避免下游读到过期数据）
     cache_file = os.path.expanduser('~/.hermes/cache/screening_latest.json')
     cache_data = {
-        'date': now.strftime('%Y-%m-%d'),
+        'date': now.strftime('%Y%m%d'),
         'passed': {code: {'score': info['score'], 'chanlun': info['chanlun']}
                    for code, info in chanlun_results.items()},
     }
@@ -194,12 +194,11 @@ def run_screening():
     backup_file = os.path.expanduser('~/.hermes/cache/backup_pool.json')
     backup_data = []
     for code, info in chanlun_results.items():
-        kl = info['kl']
-        latest = kl[-1]
+        latest = info['latest']
         backup_data.append({
             'code': code,
             'name': info['score']['name'],
-            'date': now.strftime('%Y-%m-%d'),
+            'date': now.strftime('%Y%m%d'),
             'price': latest['close'],
             'score': info['score']['total'],
             'rating': info['score']['rating'],
@@ -219,7 +218,7 @@ def run_screening():
                 history = json.load(f)
         except Exception:
             pass
-    history.append({'date': now.strftime('%Y-%m-%d'), 'stocks': backup_data})
+    history.append({'date': now.strftime('%Y%m%d'), 'stocks': backup_data})
     history = history[-60:]  # 只保留最近60天
     atomic_json_dump(history, history_file)
 

@@ -166,7 +166,7 @@ def screen_stocks(target_count=2000):
     
     # 保存白名单
     whitelist = {
-        'date': datetime.now().strftime('%Y-%m-%d'),
+        'date': datetime.now().strftime('%Y%m%d'),
         'count': len(passed),
         'stocks': {s['code']: s for s in passed},
     }
