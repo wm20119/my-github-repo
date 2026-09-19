@@ -4,7 +4,7 @@
 缠论历史胜率先筛(A/B级+三买信号) → stock-scorer评分把关
 输出：两道关都过的候选票
 """
-import sys, os, json, time, tempfile
+import sys, os, json, tempfile
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
 from kline_db import init_db, get_latest_date, upsert_klines, get_klines
 from chanlun_strategy import (

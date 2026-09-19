@@ -359,6 +359,7 @@ def run_core(do_portfolio_ops=True):
         if pf['positions']:
             sold, remaining, stuck = do_exits(pf, today, now, report, today_klines=today_klines)
             pf['positions'] = remaining
+            save_portfolio(pf)  # 出场后立即保存，防止买入崩溃丢数据
         if pool:
             bought, skipped = do_buys(pf, pool, today, now, report, today_klines=today_klines)
         save_portfolio(pf)

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 stock_log.py — 股票系统日志模块
-- 运行日志：写入 stock_system.log
 - 交易日志：写入 stock_trade_log.db（SQLite，可查询）
 """
-import os, sqlite3, json
+import os, sqlite3
 from datetime import datetime
 
 LOG_DIR = os.path.expanduser('~/.hermes/cache/logs')
@@ -34,27 +33,19 @@ def _init_trade_db():
 
 def log_trade(code, name, action, price=None, shares=None, pnl_pct=None,
               reason=None, hold_days=None, pivot_zg=None, extra=None):
-    """记录一笔交易到SQLite"""
-    conn = _init_trade_db()
-    conn.execute(
-        'INSERT INTO trades (ts, code, name, action, price, shares, pnl_pct, reason, hold_days, pivot_zg, extra) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-         code, name, action, price, shares, pnl_pct, reason, hold_days, pivot_zg, extra)
-    )
-    conn.commit()
-    conn.close()
-
-def log_event(event_type, message):
-    """记录系统事件到SQLite"""
-    conn = _init_trade_db()
-    conn.execute(
-        'INSERT INTO trades (ts, code, name, action, extra) VALUES (?, ?, ?, ?, ?)',
-        (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-         '-', event_type, 'event', message)
-    )
-    conn.commit()
-    conn.close()
+    """记录一笔交易到SQLite（失败不崩溃，只打日志）"""
+    try:
+        conn = _init_trade_db()
+        conn.execute(
+            'INSERT INTO trades (ts, code, name, action, price, shares, pnl_pct, reason, hold_days, pivot_zg, extra) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+             code, name, action, price, shares, pnl_pct, reason, hold_days, pivot_zg, extra)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠️ 交易日志写入失败: {e}")
 
 def get_recent_trades(n=20):
     """查询最近N条交易记录"""
@@ -62,15 +53,6 @@ def get_recent_trades(n=20):
     rows = conn.execute(
         'SELECT ts, code, name, action, price, shares, pnl_pct, reason, hold_days '
         'FROM trades WHERE action != "event" ORDER BY id DESC LIMIT ?', (n,)
-    ).fetchall()
-    conn.close()
-    return rows
-
-def get_recent_events(n=10):
-    """查询最近N条系统事件"""
-    conn = _init_trade_db()
-    rows = conn.execute(
-        'SELECT ts, name, extra FROM trades WHERE action = "event" ORDER BY id DESC LIMIT ?', (n,)
     ).fetchall()
     conn.close()
     return rows
