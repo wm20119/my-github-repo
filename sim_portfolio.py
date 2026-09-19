@@ -278,7 +278,7 @@ def do_buys(pf, pool, today, now, report, today_klines=None):
     total_mv = sum(p['market_value'] for p in pf['positions'])
     current_nav = pf['cash'] + total_mv
     if len(pf['positions']) >= MAX_POSITIONS:
-        return bought
+        return bought, skipped
 
     in_cooldown = False
     if pf.get('cooldown_until') and today <= pf['cooldown_until']:
@@ -286,7 +286,7 @@ def do_buys(pf, pool, today, now, report, today_klines=None):
         report.append(f"\n⚠️ 冷却期中（止损后{COOLDOWN_DAYS}天），{pf['cooldown_until']}后恢复")
 
     if in_cooldown:
-        return bought
+        return bought, skipped
 
     quality_order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
     sorted_pool = sorted(pool, key=lambda x: (

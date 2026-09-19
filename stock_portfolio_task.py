@@ -13,7 +13,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))
 
 # 日志模块
-from stock_log import log_trade, log_event
+from stock_log import log_trade
 
 # 简单日志
 LOG_DIR = os.path.expanduser('~/.hermes/cache/logs')
@@ -102,7 +102,7 @@ def fetch_today_klines(codes):
     ts_codes = [_tushare_code(c) for c in codes]
     result = {}
     try:
-        df = _TUSHARE_PRO.daily(ts_code=','.join(ts_codes),
+        df = _sp._TUSHARE_PRO.daily(ts_code=','.join(ts_codes),
                                 start_date=today, end_date=today,
                                 fields='ts_code,trade_date,open,high,low,close,vol')
         if df is not None and len(df) > 0:
@@ -426,7 +426,7 @@ def run_status():
     stats = get_stats()
     lines.append("")
     lines.append("💾 K线数据库:")
-    lines.append("  股票数: " + str(stats.get('stock_count', '?')))
+    lines.append("  股票数: " + str(stats.get('total_codes', '?')))
     lines.append("  总行数: " + str(stats.get('total_rows', '?')))
 
     pf = load_portfolio()
